@@ -10,188 +10,186 @@ SC_API_TOKEN = os.getenv("SC_API_TOKEN")
 ZBX_API_URL = os.getenv("ZBX_API_URL")
 ZBX_API_TOKEN = os.getenv("ZBX_API_TOKEN")
 
-# ID Ayarları
-# Senin kapalı ticket statü ID'nin 2 olduğunu teyit etmiştik.
+# Statü ve ID Ayarları
 closed_ids_str = os.getenv("SC_CLOSED_STATUS_IDS", "2")
 SC_STATUS_CLOSED_IDS = [int(x.strip()) for x in closed_ids_str.split(',') if x.strip()]
 
-# Zabbix Event ID'sinin saklandığı alanın ID'si (Zabbix kodundan doğrulandı: 62128)
 SC_CUSTOM_FIELD_EVENT_ID = int(os.getenv("SC_EVENT_ID_FIELD_ID", "62128"))
-
-# Ticket açıldığında hangi statüye gelsin? (Varsayılan 1=New, eğer farklıysa AWX'ten değiştir)
 SC_STATUS_REOPEN_ID = int(os.getenv("SC_REOPEN_STATUS_ID", "1"))
 
-# Geriye dönük kaç dakika baksın?
-LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "60"))
+# Başlangıç ID'si (Opsiyonel - Vermezsen otomatik bulur)
+START_ID = int(os.getenv("SC_START_ID", "146600"))
+
+# KAÇ GÜN GERİYE BAKSIN? (AWX'ten 'LOOKBACK_DAYS' olarak verebilirsin. Varsayılan 7 gün)
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "7")) 
+
+# Güvenlik Limiti: Sonsuz döngüye girmesin diye maksimum kaç ticket tarasın?
+MAX_REQUEST_LIMIT = 3000
 
 # ================= HELPERS =================
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 def sc_req(method, endpoint, data=None):
-    headers = {
-        'Content-Type': 'application/json',
-        'ApiKey': SC_API_TOKEN
-    }
+    headers = {'Content-Type': 'application/json', 'ApiKey': SC_API_TOKEN}
     url = f"{SC_API_URL}/api/v1/{endpoint}"
-    
     try:
         if method == 'GET':
             r = requests.get(url, headers=headers, params=data)
         else:
             r = requests.post(url, headers=headers, json=data) if method == 'POST' else requests.put(url, headers=headers, json=data)
-        
-        # HTML hatası veya 404 dönerse JSON decode patlar
-        if r.status_code not in [200, 201]:
-            log(f"API HTTP Error ({endpoint}): Status {r.status_code}")
-            return {}
-            
-        return r.json()
-    except Exception as e:
-        log(f"API Exception ({endpoint}): {str(e)}")
-        return {}
+        return r
+    except:
+        return None
 
 def zbx_req(method, params):
-    # Zabbix JSON-RPC
-    payload = {
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params,
-        "auth": ZBX_API_TOKEN,
-        "id": 1
-    }
+    payload = {"jsonrpc": "2.0", "method": method, "params": params, "auth": ZBX_API_TOKEN, "id": 1}
     try:
         r = requests.post(ZBX_API_URL, json=payload)
         return r.json().get('result')
-    except Exception as e:
-        log(f"Zabbix API Error: {str(e)}")
+    except:
         return None
 
-# ================= MAIN LOGIC =================
+def parse_sc_date(date_str):
+    # Örn: "2026-01-26T15:06:22.58" -> datetime objesi
+    try:
+        # Milisaniyeyi atalım, karmaşa çıkmasın
+        clean_date = date_str.split('.')[0]
+        return datetime.strptime(clean_date, "%Y-%m-%dT%H:%M:%S")
+    except:
+        return None
 
-def get_recently_closed_tickets():
-    log(f"Searching tickets with Status IDs: {SC_STATUS_CLOSED_IDS}")
+# ================= SMART LOGIC =================
 
-    # Search Endpoint Payload (ServiceCore yapısına uygun)
-    payload = {
-        "PageNumber": 1,
-        "PageSize": 20,
-        "TicketStatusIds": SC_STATUS_CLOSED_IDS
-    }
+def find_latest_ticket_id(start_from):
+    """En son Ticket ID'yi bulmak için yukarı tırmanır"""
+    current = start_from
+    step = 10
+    log(f"Finding latest ticket ID starting from {current}...")
     
-    res = sc_req('POST', 'Incident/Search', payload)
+    # 1. Hızlı Tırmanış
+    while True:
+        next_val = current + step
+        res = sc_req('GET', f'Incident/GetById/{next_val}')
+        if res and res.status_code == 200:
+            try:
+                if res.json().get('IsSuccessfull'):
+                    current = next_val
+                    continue
+            except: pass
+        break
     
-    # API cevabı bazen {Data: [], ...} bazen direkt [] dönebilir, kontrol edelim.
-    if not res:
-        log("Search API returned empty response.")
-        return []
-        
-    if isinstance(res, dict) and not res.get('IsSuccessfull', True):
-        log(f"Search API returned IsSuccessfull=False: {res.get('Message')}")
-        return []
+    # 2. Hassas Tırmanış
+    for i in range(current + 1, current + step + 1):
+        res = sc_req('GET', f'Incident/GetById/{i}')
+        if res and res.status_code == 200:
+             try:
+                if res.json().get('IsSuccessfull'): current = i
+                else: break
+             except: break
+        else: break
+            
+    log(f"Latest Ticket ID found: {current}")
+    return current
 
-    # Veriyi al
-    tickets = res.get('Data', []) if isinstance(res, dict) else res
-    
-    if not tickets:
-        log("No closed tickets found in the current page.")
-        return []
-
-    log(f"Found {len(tickets)} closed tickets. Checking details for Zabbix Event IDs...")
-    
+def scan_tickets_by_date(latest_id, days_limit):
     candidates = []
     
-    for t in tickets:
-        t_id = t.get('Id') or t.get('TicketId')
+    # Bugünden X gün öncesi (Limit Tarihi)
+    limit_date = datetime.now() - timedelta(days=days_limit)
+    log(f"Scanning tickets backwards until date: {limit_date.strftime('%Y-%m-%d %H:%M')}")
+    
+    current_id = latest_id
+    checked_count = 0
+    
+    while checked_count < MAX_REQUEST_LIMIT:
+        # API'yi yormamak için çok hafif bekleme
+        # time.sleep(0.02) 
         
-        # Listede CustomField'lar eksik olabilir. Her ticket için detay çekiyoruz.
-        # Bu işlem biraz yavaş olabilir ama en garanti yoldur.
-        detail_res = sc_req('GET', f'Incident/GetById/{t_id}')
+        res = sc_req('GET', f'Incident/GetById/{current_id}')
         
-        if not detail_res or (isinstance(detail_res, dict) and not detail_res.get('IsSuccessfull')):
-            continue
-
-        # Gerçek detay verisi
-        full_ticket = detail_res.get('Data', detail_res)
+        if res and res.status_code == 200:
+            try:
+                j = res.json()
+                if j.get('IsSuccessfull'):
+                    data = j.get('Data', {})
+                    
+                    # 1. TARİH KONTROLÜ (En Kritik Yer)
+                    # CreatedDate veya AssigntmentDate kullanılabilir.
+                    t_date_str = data.get('CreatedDate') 
+                    if t_date_str:
+                        t_date = parse_sc_date(t_date_str)
+                        if t_date and t_date < limit_date:
+                            log(f"Reached time limit at Ticket {current_id} ({t_date_str}). Stopping scan.")
+                            break
+                    
+                    # 2. STATÜ ve ZABBIX ID KONTROLÜ
+                    status_id = data.get('StatusId')
+                    if status_id in SC_STATUS_CLOSED_IDS:
+                        c_vals = data.get('CustomFieldTicketIncidentValues', [])
+                        for cf in c_vals:
+                            if cf.get('FieldIncidentValueFieldId') == SC_CUSTOM_FIELD_EVENT_ID:
+                                val = cf.get('FieldIncidentValue')
+                                if val and str(val).isdigit():
+                                    candidates.append({"id": current_id, "event_id": str(val)})
+                                    break
+            except:
+                pass
         
-        # Zabbix Event ID'yi ara (Field ID: 62128)
-        event_id = None
-        c_vals = full_ticket.get('CustomFieldTicketIncidentValues', [])
+        current_id -= 1
+        checked_count += 1
         
-        for cf in c_vals:
-            if cf.get('FieldIncidentValueFieldId') == SC_CUSTOM_FIELD_EVENT_ID:
-                val = cf.get('FieldIncidentValue')
-                if val and str(val).isdigit(): # Sadece sayısal değerleri al
-                    event_id = str(val)
-                    break
-        
-        if event_id:
-            # log(f"Candidate: Ticket {t_id} -> Event {event_id}")
-            candidates.append({"id": t_id, "event_id": event_id})
+        if current_id <= 0:
+            break
             
+    if checked_count >= MAX_REQUEST_LIMIT:
+        log(f"WARNING: Reached safety request limit ({MAX_REQUEST_LIMIT}) before hitting date limit.")
+        
     return candidates
 
 def check_zabbix_problem_status(event_id):
-    # 'recent': False -> Sadece şu an aktif problem tablosunda olanları getirir
-    # (Resolved olanlar problem tablosundan silinip history'e geçer)
-    res = zbx_req("problem.get", {
-        "eventids": [event_id],
-        "output": ["eventid"],
-        "recent": False 
-    })
+    res = zbx_req("problem.get", {"eventids": [event_id], "output": ["eventid"], "recent": False})
     return (res and len(res) > 0)
 
 def reopen_ticket(ticket_id, event_id):
-    # Sadece statüyü değiştiriyoruz. Ekip (Group), Teknisyen (Agent) vs. değişmez.
     res = sc_req('PUT', 'Incident/UpdateTicketStatus', {
-        "ticketId": ticket_id,
-        "statusId": SC_STATUS_REOPEN_ID,
-        "closeReasonId": None
+        "ticketId": ticket_id, "statusId": SC_STATUS_REOPEN_ID, "closeReasonId": None
     })
     
-    if res.get('IsSuccessfull'):
-        log(f"ACTION: Ticket {ticket_id} RE-OPENED successfully.")
-        
-        # ServiceCore'a not düş
+    if res and res.json().get('IsSuccessfull'):
+        log(f"ACTION: Ticket {ticket_id} RE-OPENED.")
         sc_req('POST', f'Incident/{ticket_id}/Conversations/Add', {
             "description": "OTOMASYON: Zabbix alarmı hala aktif olduğu için ticket tekrar açıldı.",
-            "isPrivate": True, 
-            "noteType": 1
+            "isPrivate": True, "noteType": 1
         })
-        
-        # Zabbix'e log düş (Action 4 = Add Message)
         zbx_req("event.acknowledge", {
-            "eventids": [event_id], 
-            "action": 4, 
+            "eventids": [event_id], "action": 4, 
             "message": f"AWX Automation: ServiceCore Ticket {ticket_id} re-opened because alarm is still active."
         })
     else:
-        log(f"ERROR: Failed to reopen ticket {ticket_id}. Msg: {res.get('Message')}")
+        log(f"ERROR: Failed to reopen ticket {ticket_id}")
 
 if __name__ == "__main__":
-    if not SC_API_URL or not ZBX_API_URL:
-        log("CRITICAL: API URLs missing. Check AWX Credentials.")
+    if not SC_API_URL:
+        log("CRITICAL: API URLs missing.")
         exit(1)
 
-    log("--- Starting Sync Check ---")
+    log("--- Starting Date-Based Sync Check ---")
     
-    try:
-        candidates = get_recently_closed_tickets()
+    # 1. En güncel ID'yi bul
+    latest = find_latest_ticket_id(START_ID)
+    
+    # 2. Tarih limitine kadar geriye tara
+    candidates = scan_tickets_by_date(latest, LOOKBACK_DAYS)
+    
+    if not candidates:
+        log(f"No relevant closed tickets found in the last {LOOKBACK_DAYS} days.")
+    else:
+        log(f"Found {len(candidates)} candidates in the last {LOOKBACK_DAYS} days. Checking Zabbix...")
         
-        if not candidates:
-            log("No candidates found with Event IDs.")
-        else:
-            log(f"Checking {len(candidates)} closed tickets against Zabbix...")
-            
-            for cand in candidates:
-                if check_zabbix_problem_status(cand['event_id']):
-                    log(f"MISMATCH DETECTED: Ticket {cand['id']} is Closed but Zabbix Event {cand['event_id']} is ACTIVE.")
-                    reopen_ticket(cand['id'], cand['event_id'])
-                else:
-                    # Sorun yok, gerçekten kapanmış.
-                    pass
-                    
-    except Exception as e:
-        log(f"FATAL ERROR: {str(e)}")
-            
+        for cand in candidates:
+            if check_zabbix_problem_status(cand['event_id']):
+                log(f"MISMATCH: Ticket {cand['id']} Closed / Zabbix Active. Reopening...")
+                reopen_ticket(cand['id'], cand['event_id'])
+    
     log("--- Completed ---")

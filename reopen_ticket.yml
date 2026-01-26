@@ -4,9 +4,6 @@
   connection: local
   gather_facts: false
   
-  extra_hosts:
-    watchman.bulutistan.com: "10.6.116.178"
-
   tasks:
     - name: Run Python Sync Script
       ansible.builtin.command: >
@@ -26,3 +23,4 @@
     - name: Print Script Output
       debug:
         msg: "{{ output.stdout_lines }}"
+

@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import time
+import concurrent.futures
 from datetime import datetime, timedelta
 
 # ================= CONFIG (Environment Variables) =================
@@ -17,14 +18,15 @@ SC_STATUS_CLOSED_IDS = [int(x.strip()) for x in closed_ids_str.split(',') if x.s
 SC_CUSTOM_FIELD_EVENT_ID = int(os.getenv("SC_EVENT_ID_FIELD_ID", "62128"))
 SC_STATUS_REOPEN_ID = int(os.getenv("SC_REOPEN_STATUS_ID", "1"))
 
-# Başlangıç ID'si (Opsiyonel - Vermezsen otomatik bulur)
+# Başlangıç ID (Opsiyonel)
 START_ID = int(os.getenv("SC_START_ID", "146600"))
 
-# KAÇ GÜN GERİYE BAKSIN? (AWX'ten 'LOOKBACK_DAYS' olarak verebilirsin. Varsayılan 7 gün)
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "7")) 
+# Kaç gün geriye baksın?
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "1")) 
 
-# Güvenlik Limiti: Sonsuz döngüye girmesin diye maksimum kaç ticket tarasın?
-MAX_REQUEST_LIMIT = 3000
+# Thread Sayısı (Aynı anda kaç sorgu atılsın?)
+MAX_WORKERS = 20  # 20 paralel istek idealdir, API'yi yormaz ama çok hızlandırır.
+CHUNK_SIZE = 50   # Her seferde 50'li paketler halinde işle
 
 # ================= HELPERS =================
 def log(msg):
@@ -35,9 +37,9 @@ def sc_req(method, endpoint, data=None):
     url = f"{SC_API_URL}/api/v1/{endpoint}"
     try:
         if method == 'GET':
-            r = requests.get(url, headers=headers, params=data)
+            r = requests.get(url, headers=headers, params=data, timeout=10)
         else:
-            r = requests.post(url, headers=headers, json=data) if method == 'POST' else requests.put(url, headers=headers, json=data)
+            r = requests.post(url, headers=headers, json=data, timeout=10) if method == 'POST' else requests.put(url, headers=headers, json=data, timeout=10)
         return r
     except:
         return None
@@ -45,107 +47,32 @@ def sc_req(method, endpoint, data=None):
 def zbx_req(method, params):
     payload = {"jsonrpc": "2.0", "method": method, "params": params, "auth": ZBX_API_TOKEN, "id": 1}
     try:
-        r = requests.post(ZBX_API_URL, json=payload)
+        r = requests.post(ZBX_API_URL, json=payload, timeout=5)
         return r.json().get('result')
     except:
         return None
 
 def parse_sc_date(date_str):
-    # Örn: "2026-01-26T15:06:22.58" -> datetime objesi
     try:
-        # Milisaniyeyi atalım, karmaşa çıkmasın
         clean_date = date_str.split('.')[0]
         return datetime.strptime(clean_date, "%Y-%m-%dT%H:%M:%S")
     except:
         return None
 
-# ================= SMART LOGIC =================
+# ================= CORE LOGIC =================
 
-def find_latest_ticket_id(start_from):
-    """En son Ticket ID'yi bulmak için yukarı tırmanır"""
-    current = start_from
-    step = 10
-    log(f"Finding latest ticket ID starting from {current}...")
+def fetch_ticket_details(ticket_id):
+    """Tek bir ticket'ın detayını çeker ve analiz eder"""
+    res = sc_req('GET', f'Incident/GetById/{ticket_id}')
     
-    # 1. Hızlı Tırmanış
-    while True:
-        next_val = current + step
-        res = sc_req('GET', f'Incident/GetById/{next_val}')
-        if res and res.status_code == 200:
-            try:
-                if res.json().get('IsSuccessfull'):
-                    current = next_val
-                    continue
-            except: pass
-        break
-    
-    # 2. Hassas Tırmanış
-    for i in range(current + 1, current + step + 1):
-        res = sc_req('GET', f'Incident/GetById/{i}')
-        if res and res.status_code == 200:
-             try:
-                if res.json().get('IsSuccessfull'): current = i
-                else: break
-             except: break
-        else: break
-            
-    log(f"Latest Ticket ID found: {current}")
-    return current
-
-def scan_tickets_by_date(latest_id, days_limit):
-    candidates = []
-    
-    # Bugünden X gün öncesi (Limit Tarihi)
-    limit_date = datetime.now() - timedelta(days=days_limit)
-    log(f"Scanning tickets backwards until date: {limit_date.strftime('%Y-%m-%d %H:%M')}")
-    
-    current_id = latest_id
-    checked_count = 0
-    
-    while checked_count < MAX_REQUEST_LIMIT:
-        # API'yi yormamak için çok hafif bekleme
-        # time.sleep(0.02) 
-        
-        res = sc_req('GET', f'Incident/GetById/{current_id}')
-        
-        if res and res.status_code == 200:
-            try:
-                j = res.json()
-                if j.get('IsSuccessfull'):
-                    data = j.get('Data', {})
-                    
-                    # 1. TARİH KONTROLÜ (En Kritik Yer)
-                    # CreatedDate veya AssigntmentDate kullanılabilir.
-                    t_date_str = data.get('CreatedDate') 
-                    if t_date_str:
-                        t_date = parse_sc_date(t_date_str)
-                        if t_date and t_date < limit_date:
-                            log(f"Reached time limit at Ticket {current_id} ({t_date_str}). Stopping scan.")
-                            break
-                    
-                    # 2. STATÜ ve ZABBIX ID KONTROLÜ
-                    status_id = data.get('StatusId')
-                    if status_id in SC_STATUS_CLOSED_IDS:
-                        c_vals = data.get('CustomFieldTicketIncidentValues', [])
-                        for cf in c_vals:
-                            if cf.get('FieldIncidentValueFieldId') == SC_CUSTOM_FIELD_EVENT_ID:
-                                val = cf.get('FieldIncidentValue')
-                                if val and str(val).isdigit():
-                                    candidates.append({"id": current_id, "event_id": str(val)})
-                                    break
-            except:
-                pass
-        
-        current_id -= 1
-        checked_count += 1
-        
-        if current_id <= 0:
-            break
-            
-    if checked_count >= MAX_REQUEST_LIMIT:
-        log(f"WARNING: Reached safety request limit ({MAX_REQUEST_LIMIT}) before hitting date limit.")
-        
-    return candidates
+    if res and res.status_code == 200:
+        try:
+            j = res.json()
+            if j.get('IsSuccessfull'):
+                return j.get('Data', {})
+        except:
+            pass
+    return None
 
 def check_zabbix_problem_status(event_id):
     res = zbx_req("problem.get", {"eventids": [event_id], "output": ["eventid"], "recent": False})
@@ -169,27 +96,122 @@ def reopen_ticket(ticket_id, event_id):
     else:
         log(f"ERROR: Failed to reopen ticket {ticket_id}")
 
+# ================= FAST SCAN LOGIC =================
+
+def find_latest_ticket_id(start_from):
+    current = start_from
+    step = 10
+    log(f"Finding latest ticket ID starting from {current}...")
+    
+    # Hızlı tırmanış
+    while True:
+        next_val = current + step
+        res = sc_req('GET', f'Incident/GetById/{next_val}')
+        if res and res.status_code == 200:
+            try:
+                if res.json().get('IsSuccessfull'):
+                    current = next_val
+                    continue
+            except: pass
+        break
+        
+    # Hassas tırmanış (Son noktayı bul)
+    for i in range(current + 1, current + step + 1):
+        res = sc_req('GET', f'Incident/GetById/{i}')
+        if res and res.status_code == 200:
+             try:
+                if res.json().get('IsSuccessfull'): current = i
+                else: break
+             except: break
+        else: break
+            
+    log(f"Latest Ticket ID found: {current}")
+    return current
+
+def fast_scan_and_process(latest_id, days_limit):
+    limit_date = datetime.now() - timedelta(days=days_limit)
+    log(f"Parallel Scanning backwards until: {limit_date.strftime('%Y-%m-%d %H:%M')}")
+    
+    current_high = latest_id
+    stop_scan = False
+    processed_count = 0
+    
+    # Chunklar halinde işle (Örn: 146645'ten 146595'e kadar olan 50 ticketı al)
+    while not stop_scan and processed_count < 5000: # Güvenlik limiti 5000
+        
+        # ID listesi oluştur
+        current_low = max(1, current_high - CHUNK_SIZE)
+        id_batch = list(range(current_high, current_low, -1))
+        
+        if not id_batch:
+            break
+            
+        # log(f"Processing batch: {id_batch[0]} -> {id_batch[-1]}")
+        
+        # --- PARALEL İŞLEME BAŞLIYOR ---
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # ID'leri fonksiyona dağıt
+            future_to_id = {executor.submit(fetch_ticket_details, tid): tid for tid in id_batch}
+            
+            for future in concurrent.futures.as_completed(future_to_id):
+                tid = future_to_id[future]
+                try:
+                    data = future.result()
+                    if not data:
+                        continue # Ticket yok veya hata
+                    
+                    # 1. TARİH KONTROLÜ
+                    t_date_str = data.get('CreatedDate')
+                    if t_date_str:
+                        t_date = parse_sc_date(t_date_str)
+                        if t_date and t_date < limit_date:
+                            # Bu batch'te eski tarihli ticket bulundu.
+                            # Daha geriye gitmeye gerek yok (veya batch bitince dur)
+                            stop_scan = True
+                            # log(f"Time limit reached at {tid}")
+                            continue
+
+                    # 2. STATÜ ve ZABBIX KONTROLÜ
+                    status_id = data.get('StatusId')
+                    if status_id in SC_STATUS_CLOSED_IDS:
+                        c_vals = data.get('CustomFieldTicketIncidentValues', [])
+                        event_id = None
+                        for cf in c_vals:
+                            if cf.get('FieldIncidentValueFieldId') == SC_CUSTOM_FIELD_EVENT_ID:
+                                val = cf.get('FieldIncidentValue')
+                                if val and str(val).isdigit():
+                                    event_id = str(val)
+                                    break
+                        
+                        if event_id:
+                            # Senkron çağrı (Zabbix kontrolü kritik olduğu için burada bekleyebiliriz)
+                            # Zaten Zabbix kontrolü sadece aday ticketlarda yapılıyor, sayı az.
+                            if check_zabbix_problem_status(event_id):
+                                log(f"MISMATCH: Ticket {tid} Closed / Zabbix Active. Reopening...")
+                                reopen_ticket(tid, event_id)
+                                
+                except Exception as exc:
+                    pass
+                    
+        processed_count += len(id_batch)
+        current_high = current_low
+        
+        if current_high <= 1:
+            break
+
+    return processed_count
+
 if __name__ == "__main__":
     if not SC_API_URL:
         log("CRITICAL: API URLs missing.")
         exit(1)
 
-    log("--- Starting Date-Based Sync Check ---")
+    log("--- Starting High-Performance Sync Check ---")
     
-    # 1. En güncel ID'yi bul
+    # 1. En son ID'yi bul
     latest = find_latest_ticket_id(START_ID)
     
-    # 2. Tarih limitine kadar geriye tara
-    candidates = scan_tickets_by_date(latest, LOOKBACK_DAYS)
+    # 2. Paralel Tara ve İşle
+    total = fast_scan_and_process(latest, LOOKBACK_DAYS)
     
-    if not candidates:
-        log(f"No relevant closed tickets found in the last {LOOKBACK_DAYS} days.")
-    else:
-        log(f"Found {len(candidates)} candidates in the last {LOOKBACK_DAYS} days. Checking Zabbix...")
-        
-        for cand in candidates:
-            if check_zabbix_problem_status(cand['event_id']):
-                log(f"MISMATCH: Ticket {cand['id']} Closed / Zabbix Active. Reopening...")
-                reopen_ticket(cand['id'], cand['event_id'])
-    
-    log("--- Completed ---")
+    log(f"--- Completed (Scanned ~{total} ID slots) ---")

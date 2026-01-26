@@ -71,7 +71,7 @@ def get_active_zabbix_problems():
         "recent": False,           # Sadece şu an bozuk olanlar
         "sortfield": ["eventid"],
         "sortorder": "DESC",
-        "limit": 1000              # Güvenlik limiti: En son 1000 problem
+        "limit": 5000              # Güvenlik limiti: En son 1000 problem
     }
     problems = zbx_req("problem.get", params)
     return problems or []
@@ -164,3 +164,4 @@ if __name__ == "__main__":
                     log(f"Bir işlem hatası oluştu: {exc}")
         
     log("--- İşlem Tamamlandı ---")
+

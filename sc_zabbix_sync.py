@@ -5,7 +5,7 @@ import urllib3
 import time
 from datetime import datetime
 
-# SSL Uyarılarını Gizle (IP ile gidince sertifika hatası vermemesi için)
+# 1. SSL Uyarılarını Sustur (IP ile gidince hata vermemesi için Kritik!)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================= CONFIG (Environment Variables) =================
@@ -29,7 +29,7 @@ def log(msg):
 def zbx_req(method, params):
     payload = {"jsonrpc": "2.0", "method": method, "params": params, "auth": ZBX_API_TOKEN, "id": 1}
     try:
-        # verify=False ekledik: SSL hatasını yok sayar
+        # verify=False: SSL sertifikasını kontrol etme (IP kullanınca şart)
         r = requests.post(ZBX_API_URL, json=payload, timeout=10, verify=False)
         return r.json().get('result')
     except Exception as e:
@@ -40,7 +40,6 @@ def sc_req(method, endpoint, data=None):
     headers = {'Content-Type': 'application/json', 'ApiKey': SC_API_TOKEN}
     url = f"{SC_API_URL}/api/v1/{endpoint}"
     try:
-        # verify=False ekledik
         if method == 'GET':
             r = requests.get(url, headers=headers, params=data, timeout=10, verify=False)
         else:
@@ -50,11 +49,12 @@ def sc_req(method, endpoint, data=None):
         log(f"SC Error: {e}")
         return None
 
-# ================= CORE LOGIC =================
+# ================= CORE LOGIC (REVERSE SYNC) =================
 
 def get_active_zabbix_problems():
     """Zabbix'teki aktif problemleri çeker"""
     log("Fetching active problems from Zabbix...")
+    # recent: False -> Sadece şu an problem tablosunda olanlar (Çözülmemişler)
     params = {
         "output": ["eventid", "name"],
         "recent": False,
@@ -63,16 +63,13 @@ def get_active_zabbix_problems():
     }
     problems = zbx_req("problem.get", params)
     
-    # Hata veya boş dönerse
     if problems is None:
-        log("Could not fetch problems from Zabbix (Check URL/Network).")
+        log("Could not fetch problems from Zabbix. Check URL/Network.")
         return []
-        
     return problems
 
 def find_ticket_by_event_id(event_id):
     """Event ID ile ticket arar"""
-    
     payload = {
         "fieldKey": SC_FIELD_KEY,
         "fieldValue": str(event_id),
@@ -101,10 +98,14 @@ def reopen_ticket(ticket_id, event_id):
     
     if res and res.json().get('IsSuccessfull'):
         log(f"✅ ACTION: Ticket {ticket_id} RE-OPENED.")
+        
+        # Not düş
         sc_req('POST', f'Incident/{ticket_id}/Conversations/Add', {
             "description": "OTOMASYON: Zabbix alarmı (Event: "+str(event_id)+") hala aktif olduğu için ticket tekrar açıldı.",
             "isPrivate": True, "noteType": 1
         })
+        
+        # Zabbix'e Ack bas
         zbx_req("event.acknowledge", {
             "eventids": [event_id], "action": 4, 
             "message": f"AWX Automation: ServiceCore Ticket {ticket_id} re-opened because alarm is still active."
@@ -140,7 +141,7 @@ if __name__ == "__main__":
                 tickets = found_data
             elif isinstance(found_data, dict):
                 tickets = [found_data]
-                
+            
             if not tickets:
                 continue
                 

@@ -4,21 +4,21 @@ import requests
 import urllib3
 import socket
 import time
+import concurrent.futures
 from datetime import datetime
 
-# SSL Uyarılarını Gizle
+# 1. SSL Uyarılarını Sustur
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================= CONFIG =================
 SC_API_URL = os.getenv("SC_API_URL", "").rstrip('/')
 SC_API_TOKEN = os.getenv("SC_API_TOKEN")
-ZBX_API_URL = os.getenv("ZBX_API_URL") # DOMAIN OLMALI (watchman.bulutistan.com)
+ZBX_API_URL = os.getenv("ZBX_API_URL") # Credential'da DOMAIN yazmalı
 ZBX_API_TOKEN = os.getenv("ZBX_API_TOKEN")
 
-# --- MANUEL DNS AYARI ---
-# Test sonucundan aldığımız çalışan IP'yi buraya yazıyoruz
+# --- MANUEL DNS AYARI (Testten gelen IP) ---
 ZBX_DOMAIN = "watchman.bulutistan.com"
-ZBX_REAL_IP = "10.6.116.178" 
+ZBX_REAL_IP = "10.6.116.178"
 
 # ServiceCore Ayarları
 closed_ids_str = os.getenv("SC_CLOSED_STATUS_IDS", "2")
@@ -26,45 +26,28 @@ SC_STATUS_CLOSED_IDS = [int(x.strip()) for x in closed_ids_str.split(',') if x.s
 SC_STATUS_REOPEN_ID = int(os.getenv("SC_REOPEN_STATUS_ID", "1"))
 SC_FIELD_KEY = os.getenv("SC_FIELD_KEY", "Eventid") 
 
-# ================= DEBUG LOGGER =================
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+# HIZ AYARI: Aynı anda kaç sorgu atılsın?
+MAX_WORKERS = 20
 
-# ================= DNS OVERRIDE (YENİLENMİŞ) =================
-# Bu kısım Requests kütüphanesini kandırarak Domain isteğini IP'ye çevirir.
-# SSL (SNI) Domain olarak kalır, ama paket IP'ye gider.
-
-# Orijinal fonksiyonu sakla
+# ================= DNS OVERRIDE =================
 prv_getaddrinfo = socket.getaddrinfo
-
 def new_getaddrinfo(*args):
-    host = args[0]
-    # Eğer sorgulanan adres bizim Zabbix Domain ise
-    if host == ZBX_DOMAIN:
-        # log(f"DEBUG: DNS Override Devrede! {host} -> {ZBX_REAL_IP}")
-        # Port ve diğer bilgileri koruyarak IP'yi döndür
+    if args[0] == ZBX_DOMAIN:
         return prv_getaddrinfo(ZBX_REAL_IP, *args[1:])
     return prv_getaddrinfo(*args)
-
-# Fonksiyonu değiştir
 socket.getaddrinfo = new_getaddrinfo
-# =============================================================
+# ============================================
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 def zbx_req(method, params):
     payload = {"jsonrpc": "2.0", "method": method, "params": params, "auth": ZBX_API_TOKEN, "id": 1}
     try:
-        log(f"   -> Zabbix İsteği Gönderiliyor: {method}")
-        start = time.time()
-        
-        # Timeout 10sn verildi. verify=False ile sertifika hatası engellendi.
+        # Timeout'u kısalttık, takılmasın
         r = requests.post(ZBX_API_URL, json=payload, timeout=10, verify=False)
-        
-        duration = time.time() - start
-        log(f"   <- Zabbix Cevap Döndü ({duration:.2f}s). HTTP {r.status_code}")
-        
         return r.json().get('result')
-    except Exception as e:
-        log(f"❌ Zabbix Hatası: {e}")
+    except:
         return None
 
 def sc_req(method, endpoint, data=None):
@@ -72,35 +55,28 @@ def sc_req(method, endpoint, data=None):
     url = f"{SC_API_URL}/api/v1/{endpoint}"
     try:
         if method == 'GET':
-            r = requests.get(url, headers=headers, params=data, timeout=10, verify=False)
+            r = requests.get(url, headers=headers, params=data, timeout=5, verify=False)
         else:
-            r = requests.post(url, headers=headers, json=data, timeout=10, verify=False) if method == 'POST' else requests.put(url, headers=headers, json=data, timeout=10, verify=False)
+            r = requests.post(url, headers=headers, json=data, timeout=5, verify=False) if method == 'POST' else requests.put(url, headers=headers, json=data, timeout=5, verify=False)
         return r
-    except Exception as e:
-        log(f"SC Hatası: {e}")
+    except:
         return None
 
-# ================= ANA MANTIK =================
+# ================= CORE LOGIC =================
 
 def get_active_zabbix_problems():
-    log(f"Zabbix'e bağlanılıyor... ({ZBX_DOMAIN} -> {ZBX_REAL_IP})")
-    
-    # Sadece aktif (çözülmemiş) problemleri getir
+    log(f"Zabbix aktif problemler çekiliyor...")
     params = {
         "output": ["eventid", "name"],
-        "recent": False,
+        "recent": False,           # Sadece şu an bozuk olanlar
         "sortfield": ["eventid"],
-        "sortorder": "DESC"
+        "sortorder": "DESC",
+        "limit": 1000              # Güvenlik limiti: En son 1000 problem
     }
     problems = zbx_req("problem.get", params)
-    
-    if problems is None:
-        log("⚠️ Zabbix'ten veri alınamadı.")
-        return []
-    return problems
+    return problems or []
 
 def find_ticket_by_event_id(event_id):
-    # ServiceCore'da bu Event ID'yi ara
     payload = {
         "fieldKey": SC_FIELD_KEY,
         "fieldValue": str(event_id),
@@ -117,64 +93,74 @@ def find_ticket_by_event_id(event_id):
     return None
 
 def reopen_ticket(ticket_id, event_id):
-    log(f"🔧 Ticket {ticket_id} tekrar açılıyor...")
     res = sc_req('PUT', 'Incident/UpdateTicketStatus', {
         "ticketId": ticket_id, "statusId": SC_STATUS_REOPEN_ID, "closeReasonId": None
     })
     
     if res and res.json().get('IsSuccessfull'):
-        log(f"✅ BAŞARILI: Ticket {ticket_id} AÇILDI.")
-        
-        # Not düş
+        log(f"✅ ACTION: Ticket {ticket_id} AÇILDI (Event: {event_id})")
         sc_req('POST', f'Incident/{ticket_id}/Conversations/Add', {
-            "description": f"OTOMASYON: Zabbix alarmı (Event: {event_id}) aktif olduğu için ticket tekrar açıldı.",
+            "description": f"OTOMASYON: Zabbix alarmı ({event_id}) aktif olduğu için ticket tekrar açıldı.",
             "isPrivate": True, "noteType": 1
         })
-        
-        # Zabbix Ack
         zbx_req("event.acknowledge", {
             "eventids": [event_id], "action": 4, 
-            "message": f"AWX Automation: ServiceCore Ticket {ticket_id} re-opened because alarm is still active."
+            "message": f"AWX Automation: Ticket {ticket_id} re-opened."
         })
     else:
-        log(f"❌ HATA: Ticket açılamadı.")
+        log(f"❌ HATA: Ticket {ticket_id} açılamadı.")
+
+def process_single_problem(problem):
+    """Tek bir Zabbix problemini alır ve SC'de kontrol eder (İşçi Fonksiyonu)"""
+    eid = problem.get('eventid')
+    # name = problem.get('name')
+    
+    found_data = find_ticket_by_event_id(eid)
+    
+    tickets = []
+    if isinstance(found_data, list): tickets = found_data
+    elif isinstance(found_data, dict): tickets = [found_data]
+    
+    if not tickets:
+        return
+        
+    for t in tickets:
+        t_id = t.get('Id') or t.get('TicketId')
+        status_id = t.get('StatusId')
+        
+        # Ticket KAPALI (2) ama Zabbix AKTİF
+        if status_id in SC_STATUS_CLOSED_IDS:
+            log(f"⚠️ UYUŞMAZLIK BULUNDU: Ticket {t_id} Kapalı / Zabbix Aktif.")
+            reopen_ticket(t_id, eid)
+
+# ================= MAIN =================
 
 if __name__ == "__main__":
     if not SC_API_URL or not ZBX_API_URL:
-        log("CRITICAL: API URL'leri eksik.")
+        log("CRITICAL: API URL eksik.")
         exit(1)
 
-    log("--- Zabbix Sync Başlatılıyor ---")
+    log("--- Zabbix Sync (Turbo Mod) Başlatılıyor ---")
     
-    # 1. Zabbix Aktif Problemleri Al
     active_problems = get_active_zabbix_problems()
+    total_probs = len(active_problems)
     
-    if not active_problems:
-        log("Zabbix'te aktif problem yok veya bağlantı başarısız.")
+    if total_probs == 0:
+        log("Zabbix'te aktif problem yok.")
     else:
-        log(f"🔍 Zabbix'te {len(active_problems)} adet aktif problem bulundu. Kontrol ediliyor...")
+        log(f"İşlenecek Aktif Alarm Sayısı: {total_probs}")
+        log(f"Paralel İşlem Başlıyor ({MAX_WORKERS} kanal)...")
         
-        for problem in active_problems:
-            eid = problem.get('eventid')
-            name = problem.get('name')
+        # --- PARALEL İŞLEME MOTORU ---
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Tüm problemleri havuza at ve dağıt
+            futures = {executor.submit(process_single_problem, p): p for p in active_problems}
             
-            # ServiceCore Kontrolü
-            found_data = find_ticket_by_event_id(eid)
-            
-            tickets = []
-            if isinstance(found_data, list): tickets = found_data
-            elif isinstance(found_data, dict): tickets = [found_data]
-            
-            if not tickets:
-                continue
-                
-            for t in tickets:
-                t_id = t.get('Id') or t.get('TicketId')
-                status_id = t.get('StatusId')
-                
-                # Ticket KAPALI (2) ama Zabbix AKTİF -> AÇ
-                if status_id in SC_STATUS_CLOSED_IDS:
-                    log(f"⚠️ UYUŞMAZLIK: Ticket {t_id} Kapalı ama Zabbix Alarmı ({eid}) Aktif!")
-                    reopen_ticket(t_id, eid)
-
+            # Tamamlananları bekle (Log akışı için)
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    log(f"Bir işlem hatası oluştu: {exc}")
+        
     log("--- İşlem Tamamlandı ---")

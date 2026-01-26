@@ -2,34 +2,55 @@ import os
 import json
 import requests
 import urllib3
+import socket
 import time
 from datetime import datetime
 
-# 1. SSL Uyarılarını Sustur (IP ile gidince hata vermemesi için Kritik!)
+# 1. SSL Uyarılarını Sustur
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ================= CONFIG (Environment Variables) =================
+# ================= CONFIG =================
 SC_API_URL = os.getenv("SC_API_URL", "").rstrip('/')
 SC_API_TOKEN = os.getenv("SC_API_TOKEN")
-ZBX_API_URL = os.getenv("ZBX_API_URL")
+ZBX_API_URL = os.getenv("ZBX_API_URL") # Buraya DOMAIN gelmeli (Credential'dan)
 ZBX_API_TOKEN = os.getenv("ZBX_API_TOKEN")
 
-# ServiceCore Statüleri
+# --- KRİTİK AYAR: DNS OVERRIDE ---
+# AWX DNS çözemediği için, Domain'i IP'ye biz yönlendiriyoruz.
+ZBX_DOMAIN = "watchman.bulutistan.com"
+ZBX_REAL_IP = "10.6.116.178"  # Sizin verdiğiniz IP
+
+# ServiceCore Ayarları
 closed_ids_str = os.getenv("SC_CLOSED_STATUS_IDS", "2")
 SC_STATUS_CLOSED_IDS = [int(x.strip()) for x in closed_ids_str.split(',') if x.strip()]
 SC_STATUS_REOPEN_ID = int(os.getenv("SC_REOPEN_STATUS_ID", "1"))
-
-# Custom Field Key (Eventid)
 SC_FIELD_KEY = os.getenv("SC_FIELD_KEY", "Eventid") 
 
-# ================= HELPERS =================
+# ================= DNS HACK (The Magic) =================
+# Bu blok, Python'un socket kütüphanesini 'hook'lar.
+# Kod ne zaman 'watchman.bulutistan.com'a gitmeye çalışsa, 
+# DNS sunucusuna sormadan direkt bizim verdiğimiz IP'ye gider.
+# Böylece URL'de Domain kaldığı için SSL (SNI) hatası almayız!
+
+prv_getaddrinfo = socket.getaddrinfo
+
+def new_getaddrinfo(*args):
+    # Eğer sorgulanan adres bizim Zabbix domaini ise
+    if args[0] == ZBX_DOMAIN:
+        # Direkt IP'yi döndür (Port ve protokolü koruyarak)
+        return prv_getaddrinfo(ZBX_REAL_IP, *args[1:])
+    return prv_getaddrinfo(*args)
+
+socket.getaddrinfo = new_getaddrinfo
+# ========================================================
+
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 def zbx_req(method, params):
+    # URL içinde Domain yazıyor ama Python arka planda IP'ye gidecek
     payload = {"jsonrpc": "2.0", "method": method, "params": params, "auth": ZBX_API_TOKEN, "id": 1}
     try:
-        # verify=False: SSL sertifikasını kontrol etme (IP kullanınca şart)
         r = requests.post(ZBX_API_URL, json=payload, timeout=10, verify=False)
         return r.json().get('result')
     except Exception as e:
@@ -49,12 +70,10 @@ def sc_req(method, endpoint, data=None):
         log(f"SC Error: {e}")
         return None
 
-# ================= CORE LOGIC (REVERSE SYNC) =================
+# ================= CORE LOGIC =================
 
 def get_active_zabbix_problems():
-    """Zabbix'teki aktif problemleri çeker"""
-    log("Fetching active problems from Zabbix...")
-    # recent: False -> Sadece şu an problem tablosunda olanlar (Çözülmemişler)
+    log(f"Fetching active problems from Zabbix ({ZBX_DOMAIN})...")
     params = {
         "output": ["eventid", "name"],
         "recent": False,
@@ -64,12 +83,11 @@ def get_active_zabbix_problems():
     problems = zbx_req("problem.get", params)
     
     if problems is None:
-        log("Could not fetch problems from Zabbix. Check URL/Network.")
+        log("Could not fetch problems from Zabbix. Check Network/Credentials.")
         return []
     return problems
 
 def find_ticket_by_event_id(event_id):
-    """Event ID ile ticket arar"""
     payload = {
         "fieldKey": SC_FIELD_KEY,
         "fieldValue": str(event_id),
@@ -78,34 +96,25 @@ def find_ticket_by_event_id(event_id):
         "minusSecondValue": 0,
         "dataKey": ""
     }
-    
     res = sc_req('POST', 'Incident/SearchIncidentByCustomField', payload)
-    
     if res and res.status_code == 200:
         try:
             j = res.json()
             if j.get('IsSuccessfull'):
                 return j.get('Data')
-        except:
-            pass
+        except: pass
     return None
 
 def reopen_ticket(ticket_id, event_id):
-    """Ticket'ı tekrar açar"""
     res = sc_req('PUT', 'Incident/UpdateTicketStatus', {
         "ticketId": ticket_id, "statusId": SC_STATUS_REOPEN_ID, "closeReasonId": None
     })
-    
     if res and res.json().get('IsSuccessfull'):
         log(f"✅ ACTION: Ticket {ticket_id} RE-OPENED.")
-        
-        # Not düş
         sc_req('POST', f'Incident/{ticket_id}/Conversations/Add', {
-            "description": "OTOMASYON: Zabbix alarmı (Event: "+str(event_id)+") hala aktif olduğu için ticket tekrar açıldı.",
+            "description": f"OTOMASYON: Zabbix alarmı (Event: {event_id}) aktif olduğu için ticket tekrar açıldı.",
             "isPrivate": True, "noteType": 1
         })
-        
-        # Zabbix'e Ack bas
         zbx_req("event.acknowledge", {
             "eventids": [event_id], "action": 4, 
             "message": f"AWX Automation: ServiceCore Ticket {ticket_id} re-opened because alarm is still active."
@@ -113,14 +122,12 @@ def reopen_ticket(ticket_id, event_id):
     else:
         log(f"❌ ERROR: Failed to reopen ticket {ticket_id}")
 
-# ================= MAIN =================
-
 if __name__ == "__main__":
     if not SC_API_URL or not ZBX_API_URL:
         log("CRITICAL: API URLs missing.")
         exit(1)
 
-    log("--- Starting Zabbix-Driven Sync (Reverse Logic) ---")
+    log("--- Starting Zabbix-Driven Sync (DNS Hack Enabled) ---")
     
     active_problems = get_active_zabbix_problems()
     
@@ -133,23 +140,18 @@ if __name__ == "__main__":
             eid = problem.get('eventid')
             name = problem.get('name')
             
-            # Bu Event ID'ye sahip bir ticket var mı?
             found_data = find_ticket_by_event_id(eid)
             
             tickets = []
-            if isinstance(found_data, list):
-                tickets = found_data
-            elif isinstance(found_data, dict):
-                tickets = [found_data]
+            if isinstance(found_data, list): tickets = found_data
+            elif isinstance(found_data, dict): tickets = [found_data]
             
-            if not tickets:
-                continue
+            if not tickets: continue
                 
             for t in tickets:
                 t_id = t.get('Id') or t.get('TicketId')
                 status_id = t.get('StatusId')
                 
-                # Ticket KAPALI (2) ama Zabbix AKTİF ise -> AÇ
                 if status_id in SC_STATUS_CLOSED_IDS:
                     log(f"⚠️ MISMATCH: Zabbix Active ({eid}) <-> Ticket Closed ({t_id}). Status: {status_id}")
                     reopen_ticket(t_id, eid)

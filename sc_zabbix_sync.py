@@ -17,17 +17,21 @@ SC_API_TOKEN = os.getenv("SC_API_TOKEN")
 ZBX_API_URL = os.getenv("ZBX_API_URL") 
 ZBX_API_TOKEN = os.getenv("ZBX_API_TOKEN")
 
-# URL OLUŞTURMAK İÇİN ÖN YÜZ ADRESİ
-# API adresi ile Panel adresi farklı olduğu için burayı elle tanımladım.
+# URL oluşturmak için Panel Adresi
 SC_PANEL_URL = "https://operationsupport.bulutistan.com"
 
-# DNS HACK
+# DNS
 ZBX_DOMAIN = "watchman.bulutistan.com"
 ZBX_REAL_IP = "10.6.116.178"
 
-# --- ZORLAYICI STATÜ AYARI (GÜNCELLENDİ) ---
-# Hedef Statü: 78 (Atandı / Assigned)
-SC_TARGET_STATUS_ID = int(os.getenv("SC_REOPEN_STATUS_ID", "78"))
+# --- AYARLAR ---
+# 1. Yasaklı Statüler
+# 2:Kapatılan, 46:Tamamlanmış, 83:Çözüldü, 94:İptal, 65:Ertelenen
+bad_ids_str = os.getenv("SC_BAD_STATUS_IDS", "2, 46, 83, 94, 65")
+SC_BAD_STATUS_IDS = [int(x.strip()) for x in bad_ids_str.split(',') if x.strip()]
+
+# 2. Hedef Statü (Kurtarınca ne yapalım? -> 78: Atandı)
+SC_TARGET_STATUS_ID = int(os.getenv("SC_TARGET_STATUS_ID", "78"))
 
 # ================= DNS OVERRIDE =================
 prv_getaddrinfo = socket.getaddrinfo
@@ -65,7 +69,7 @@ def get_active_problems_with_ticket_ids():
     log("Zabbix'ten aktif problemler çekiliyor...")
     
     params = {
-        "output": ["eventid", "name", "acknowledged"], # 'acknowledged' bilgisini de iste
+        "output": ["eventid", "name", "acknowledged"],
         "selectAcknowledges": "extend",
         "recent": False,
         "sortfield": ["eventid"],
@@ -80,17 +84,14 @@ def get_active_problems_with_ticket_ids():
     
     for p in problems:
         event_id = p.get('eventid')
-        is_acked = p.get('acknowledged') # 0 veya 1 döner
+        is_acked = p.get('acknowledged')
         acks = p.get('acknowledges', [])
         
-        # --- KURAL: EĞER ZABBIX'TE ACKNOWLEDGE EDİLMİŞSE DOKUNMA ---
+        # KURAL 1: Zabbix'te Ack (Onay) varsa dokunma.
         if str(is_acked) == "1":
-            # Bu event biri tarafından üstlenilmiş, pas geçiyoruz.
             continue
             
         ticket_id = None
-        
-        # Mesajlardan ID bulma
         for ack in acks:
             msg = ack.get('message', '')
             match = re.search(r'ServiceCoreID\s*=\s*(\d+)', msg, re.IGNORECASE)
@@ -103,11 +104,10 @@ def get_active_problems_with_ticket_ids():
             
     return targets
 
-def check_and_enforce_status(target):
+def check_and_rescue_ticket(target):
     t_id = target['ticket_id']
     e_id = target['event_id']
     
-    # 1. Ticket Detayını Çek
     res = sc_req('GET', f'Incident/GetById/{t_id}')
     
     if res and res.status_code == 200:
@@ -115,12 +115,12 @@ def check_and_enforce_status(target):
             data = res.json().get('Data', {})
             current_status = data.get('StatusId')
             
-            # 2. Eğer mevcut statü 78 değilse -> Değiştir
-            if current_status != SC_TARGET_STATUS_ID:
+            # KURAL 2: Statü "Yasaklı Listesinde" ise müdahale et.
+            if current_status in SC_BAD_STATUS_IDS:
                 
-                log(f"⚠️ STATÜ UYUMSUZLUĞU: Ticket {t_id} (Statü: {current_status}) -> Hedef: {SC_TARGET_STATUS_ID}")
+                log(f"⚠️ MÜDAHALE: Ticket {t_id} (Statü: {current_status}) -> Hedef: {SC_TARGET_STATUS_ID}")
                 
-                # Statüyü 78 YAP
+                # Statüyü Düzelt
                 reopen_res = sc_req('PUT', 'Incident/UpdateTicketStatus', {
                     "ticketId": t_id, 
                     "statusId": SC_TARGET_STATUS_ID, 
@@ -128,22 +128,18 @@ def check_and_enforce_status(target):
                 })
                 
                 if reopen_res and reopen_res.json().get('IsSuccessfull'):
-                    log(f"✅ Ticket {t_id} başarıyla {SC_TARGET_STATUS_ID} (Atandı) yapıldı.")
+                    log(f"✅ Ticket {t_id} başarıyla {SC_TARGET_STATUS_ID} statüsüne çekildi.")
                     
-                    # URL Hazırla
                     ticket_url = f"{SC_PANEL_URL}/Ticket/EditV2?id={t_id}"
                     
-                    # Not Düş
+                    # SC Mesajı
                     sc_req('POST', f'Incident/{t_id}/Conversations/Add', {
-                        "description": f"OTOMASYON: Zabbix alarmı aktif olduğu için statü {SC_TARGET_STATUS_ID} (Atandı) olarak güncellendi.",
+                        "description": "Zabbix alarmı aktif olduğu için otomasyon tarafından tekrardan açıldı.",
                         "isPrivate": True, "noteType": 1
                     })
                     
-                    # Zabbix'e Mesaj + URL (Action: 4 = Acknowledge & Message)
-                    # NOT: Bu işlem eventi 'Acknowledged' yapacağı için, 
-                    # bir sonraki turda script bu eventi 'Kural 1' gereği pas geçecektir (Ki bu doğru, döngüye girmez).
+                    # Zabbix Mesajı
                     zbx_msg = f"AWX Automation: Ticket {t_id} re-opened. | URL={ticket_url}"
-                    
                     zbx_req("event.acknowledge", {
                         "eventids": [e_id], "action": 4, 
                         "message": zbx_msg
@@ -156,15 +152,16 @@ if __name__ == "__main__":
         log("CRITICAL: API URL eksik.")
         exit(1)
 
-    log(f"--- ServiceCore Sync (Target: {SC_TARGET_STATUS_ID} | Skip Acked: ON) ---")
+    log(f"--- ServiceCore Safe Sync (Target: {SC_TARGET_STATUS_ID}) ---")
+    log(f"--- Bad Status List: {SC_BAD_STATUS_IDS} ---")
     
     targets = get_active_problems_with_ticket_ids()
     
     if not targets:
-        log("İşlenecek kayıt bulunamadı (Ack edilenler hariç).")
+        log("Müdahale edilecek kayıt bulunamadı (Temiz).")
     else:
         log(f"Kontrol edilecek eşleşme sayısı: {len(targets)}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            executor.map(check_and_enforce_status, targets)
+            executor.map(check_and_rescue_ticket, targets)
             
     log("--- Bitti ---")

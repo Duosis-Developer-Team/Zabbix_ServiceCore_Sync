@@ -7,7 +7,7 @@
   tasks:
     - name: Run Python Sync Script
       ansible.builtin.command: >
-        python3 sc_sync_v4_assigned.py
+        python3 sc_zabbix_sync.py
       environment:
         SC_API_URL: "{{ sc_url }}"
         SC_API_TOKEN: "{{ sc_token }}"
@@ -25,3 +25,4 @@
     - name: Print Script Output
       debug:
         msg: "{{ output.stdout_lines }}"
+

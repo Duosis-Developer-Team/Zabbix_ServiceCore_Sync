@@ -14,10 +14,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ================= CONFIG =================
 SC_API_URL = os.getenv("SC_API_URL", "").rstrip('/')
 SC_API_TOKEN = os.getenv("SC_API_TOKEN")
-ZBX_API_URL = os.getenv("ZBX_API_URL") # DOMAIN OLMALI
+ZBX_API_URL = os.getenv("ZBX_API_URL") 
 ZBX_API_TOKEN = os.getenv("ZBX_API_TOKEN")
 
-# DNS HACK (Hız ve Erişim İçin Şart)
+# DNS HACK
 ZBX_DOMAIN = "watchman.bulutistan.com"
 ZBX_REAL_IP = "10.6.116.178"
 
@@ -60,15 +60,16 @@ def sc_req(method, endpoint, data=None):
 
 def get_active_problems_with_ticket_ids():
     """
-    Zabbix'teki aktif problemleri ve mesajlarını çeker.
-    Mesajların içinden 'ServiceCoreID=12345' bilgisini ayıklar.
+    Zabbix'teki aktif problemleri çeker.
+    Eğer problem 'Acknowledged' (Onaylanmış) ise pas geçer.
     """
     log("Zabbix'ten aktif problemler ve mesajlar çekiliyor...")
     
     params = {
-        "output": ["eventid", "name"],
-        "selectAcknowledges": "extend", # Mesajları da getir
-        "recent": False,                # Sadece aktifler
+        # 'acknowledged' bilgisini de istiyoruz
+        "output": ["eventid", "name", "acknowledged"], 
+        "selectAcknowledges": "extend",
+        "recent": False,
         "sortfield": ["eventid"],
         "sortorder": "DESC"
     }
@@ -80,14 +81,21 @@ def get_active_problems_with_ticket_ids():
     
     for p in problems:
         event_id = p.get('eventid')
+        # Acknowledged durumu (0: Hayır, 1: Evet)
+        is_acked = p.get('acknowledged') 
         acks = p.get('acknowledges', [])
         
+        # --- YENİ EKLENEN KONTROL ---
+        # Eğer Zabbix'te Ack (Onay) verilmişse, bu ticket'a dokunma.
+        if str(is_acked) == "1":
+            # log(f"Event {event_id} onaylandığı (Ack) için atlandı.") # İstersen logu açabilirsin
+            continue
+            
         ticket_id = None
         
         # Mesajların içinde ID ara
         for ack in acks:
             msg = ack.get('message', '')
-            # Regex ile ServiceCoreID=12345 yakala
             match = re.search(r'ServiceCoreID\s*=\s*(\d+)', msg, re.IGNORECASE)
             if match:
                 ticket_id = match.group(1)
@@ -103,7 +111,7 @@ def check_and_reopen(target):
     t_id = target['ticket_id']
     e_id = target['event_id']
     
-    # Direkt Ticket'a git (Arama yok!)
+    # Direkt Ticket'a git
     res = sc_req('GET', f'Incident/GetById/{t_id}')
     
     if res and res.status_code == 200:
@@ -111,9 +119,9 @@ def check_and_reopen(target):
             data = res.json().get('Data', {})
             status = data.get('StatusId')
             
-            # Eğer Kapalıysa (2) -> REOPEN
+            # Eğer Kapalıysa -> REOPEN
             if status in SC_STATUS_CLOSED_IDS:
-                log(f"⚠️ UYUŞMAZLIK: Ticket {t_id} Kapalı / Alarm {e_id} Aktif. Açılıyor...")
+                log(f"⚠️ UYUŞMAZLIK: Ticket {t_id} Kapalı / Alarm {e_id} Aktif (Ack Yok). Açılıyor...")
                 
                 # Tekrar Aç
                 reopen_res = sc_req('PUT', 'Incident/UpdateTicketStatus', {
@@ -125,7 +133,7 @@ def check_and_reopen(target):
                     
                     # Not Ekle
                     sc_req('POST', f'Incident/{t_id}/Conversations/Add', {
-                        "description": f"OTOMASYON: Zabbix alarmı ({e_id}) hala aktif olduğu için ticket tekrar açıldı.",
+                        "description": f"OTOMASYON: Zabbix alarmı ({e_id}) aktif ve onaysız olduğu için ticket tekrar açıldı.",
                         "isPrivate": True, "noteType": 1
                     })
                     # Zabbix'e Mesaj At
@@ -141,19 +149,16 @@ if __name__ == "__main__":
         log("CRITICAL: API URL eksik.")
         exit(1)
 
-    log("--- ServiceCore Sync (Smart Mode) ---")
+    log("--- ServiceCore Sync (Smart Mode + Ack Check) ---")
     
-    # 1. Zabbix'ten ID'leri al
     targets = get_active_problems_with_ticket_ids()
     
     if not targets:
-        log("Zabbix'te aktif olup ServiceCoreID içeren kayıt bulunamadı.")
+        log("İşlenecek kayıt bulunamadı (Ack edilenler hariç).")
     else:
         log(f"Kontrol edilecek eşleşme sayısı: {len(targets)}")
         
-        # 2. Hızlıca Kontrol Et (Multi-Thread)
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
             executor.map(check_and_reopen, targets)
             
     log("--- Bitti ---")
-

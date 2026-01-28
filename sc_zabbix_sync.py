@@ -11,20 +11,23 @@ from datetime import datetime
 # 1. SSL Uyarılarını Sustur
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ================= CONFIG =================
+# ================= CONFIG (Environment Variables) =================
 SC_API_URL = os.getenv("SC_API_URL", "").rstrip('/')
 SC_API_TOKEN = os.getenv("SC_API_TOKEN")
-ZBX_API_URL = os.getenv("ZBX_API_URL") # DOMAIN OLMALI
+ZBX_API_URL = os.getenv("ZBX_API_URL") 
 ZBX_API_TOKEN = os.getenv("ZBX_API_TOKEN")
 
-# DNS HACK (Hız ve Erişim İçin Şart)
+# URL OLUŞTURMAK İÇİN ÖN YÜZ ADRESİ
+# API adresi ile Panel adresi farklı olduğu için burayı elle tanımladım.
+SC_PANEL_URL = "https://operationsupport.bulutistan.com"
+
+# DNS HACK
 ZBX_DOMAIN = "watchman.bulutistan.com"
 ZBX_REAL_IP = "10.6.116.178"
 
-# ServiceCore Ayarları
-closed_ids_str = os.getenv("SC_CLOSED_STATUS_IDS", "2")
-SC_STATUS_CLOSED_IDS = [int(x.strip()) for x in closed_ids_str.split(',') if x.strip()]
-SC_STATUS_REOPEN_ID = int(os.getenv("SC_REOPEN_STATUS_ID", "1"))
+# --- ZORLAYICI STATÜ AYARI (GÜNCELLENDİ) ---
+# Hedef Statü: 78 (Atandı / Assigned)
+SC_TARGET_STATUS_ID = int(os.getenv("SC_REOPEN_STATUS_ID", "78"))
 
 # ================= DNS OVERRIDE =================
 prv_getaddrinfo = socket.getaddrinfo
@@ -59,18 +62,15 @@ def sc_req(method, endpoint, data=None):
 # ================= CORE LOGIC =================
 
 def get_active_problems_with_ticket_ids():
-    """
-    Zabbix'teki aktif problemleri ve mesajlarını çeker.
-    Mesajların içinden 'ServiceCoreID=12345' bilgisini ayıklar.
-    """
-    log("Zabbix'ten aktif problemler ve mesajlar çekiliyor...")
+    log("Zabbix'ten aktif problemler çekiliyor...")
     
     params = {
-        "output": ["eventid", "name"],
-        "selectAcknowledges": "extend", # Mesajları da getir
-        "recent": False,                # Sadece aktifler
+        "output": ["eventid", "name", "acknowledged"], # 'acknowledged' bilgisini de iste
+        "selectAcknowledges": "extend",
+        "recent": False,
         "sortfield": ["eventid"],
-        "sortorder": "DESC"
+        "sortorder": "DESC",
+        "limit": 1000
     }
     
     problems = zbx_req("problem.get", params)
@@ -80,14 +80,19 @@ def get_active_problems_with_ticket_ids():
     
     for p in problems:
         event_id = p.get('eventid')
+        is_acked = p.get('acknowledged') # 0 veya 1 döner
         acks = p.get('acknowledges', [])
         
+        # --- KURAL: EĞER ZABBIX'TE ACKNOWLEDGE EDİLMİŞSE DOKUNMA ---
+        if str(is_acked) == "1":
+            # Bu event biri tarafından üstlenilmiş, pas geçiyoruz.
+            continue
+            
         ticket_id = None
         
-        # Mesajların içinde ID ara
+        # Mesajlardan ID bulma
         for ack in acks:
             msg = ack.get('message', '')
-            # Regex ile ServiceCoreID=12345 yakala
             match = re.search(r'ServiceCoreID\s*=\s*(\d+)', msg, re.IGNORECASE)
             if match:
                 ticket_id = match.group(1)
@@ -98,40 +103,50 @@ def get_active_problems_with_ticket_ids():
             
     return targets
 
-def check_and_reopen(target):
-    """Tek bir hedefi kontrol et"""
+def check_and_enforce_status(target):
     t_id = target['ticket_id']
     e_id = target['event_id']
     
-    # Direkt Ticket'a git (Arama yok!)
+    # 1. Ticket Detayını Çek
     res = sc_req('GET', f'Incident/GetById/{t_id}')
     
     if res and res.status_code == 200:
         try:
             data = res.json().get('Data', {})
-            status = data.get('StatusId')
+            current_status = data.get('StatusId')
             
-            # Eğer Kapalıysa (2) -> REOPEN
-            if status in SC_STATUS_CLOSED_IDS:
-                log(f"⚠️ UYUŞMAZLIK: Ticket {t_id} Kapalı / Alarm {e_id} Aktif. Açılıyor...")
+            # 2. Eğer mevcut statü 78 değilse -> Değiştir
+            if current_status != SC_TARGET_STATUS_ID:
                 
-                # Tekrar Aç
+                log(f"⚠️ STATÜ UYUMSUZLUĞU: Ticket {t_id} (Statü: {current_status}) -> Hedef: {SC_TARGET_STATUS_ID}")
+                
+                # Statüyü 78 YAP
                 reopen_res = sc_req('PUT', 'Incident/UpdateTicketStatus', {
-                    "ticketId": t_id, "statusId": SC_STATUS_REOPEN_ID, "closeReasonId": None
+                    "ticketId": t_id, 
+                    "statusId": SC_TARGET_STATUS_ID, 
+                    "closeReasonId": None
                 })
                 
                 if reopen_res and reopen_res.json().get('IsSuccessfull'):
-                    log(f"✅ Ticket {t_id} başarıyla tekrar açıldı.")
+                    log(f"✅ Ticket {t_id} başarıyla {SC_TARGET_STATUS_ID} (Atandı) yapıldı.")
                     
-                    # Not Ekle
+                    # URL Hazırla
+                    ticket_url = f"{SC_PANEL_URL}/Ticket/EditV2?id={t_id}"
+                    
+                    # Not Düş
                     sc_req('POST', f'Incident/{t_id}/Conversations/Add', {
-                        "description": f"OTOMASYON: Zabbix alarmı ({e_id}) hala aktif olduğu için ticket tekrar açıldı.",
+                        "description": f"OTOMASYON: Zabbix alarmı aktif olduğu için statü {SC_TARGET_STATUS_ID} (Atandı) olarak güncellendi.",
                         "isPrivate": True, "noteType": 1
                     })
-                    # Zabbix'e Mesaj At
+                    
+                    # Zabbix'e Mesaj + URL (Action: 4 = Acknowledge & Message)
+                    # NOT: Bu işlem eventi 'Acknowledged' yapacağı için, 
+                    # bir sonraki turda script bu eventi 'Kural 1' gereği pas geçecektir (Ki bu doğru, döngüye girmez).
+                    zbx_msg = f"AWX Automation: Ticket {t_id} re-opened. | URL={ticket_url}"
+                    
                     zbx_req("event.acknowledge", {
                         "eventids": [e_id], "action": 4, 
-                        "message": f"AWX Automation: Ticket {t_id} re-opened."
+                        "message": zbx_msg
                     })
         except:
             pass
@@ -141,18 +156,15 @@ if __name__ == "__main__":
         log("CRITICAL: API URL eksik.")
         exit(1)
 
-    log("--- ServiceCore Sync (Smart Mode) ---")
+    log(f"--- ServiceCore Sync (Target: {SC_TARGET_STATUS_ID} | Skip Acked: ON) ---")
     
-    # 1. Zabbix'ten ID'leri al
     targets = get_active_problems_with_ticket_ids()
     
     if not targets:
-        log("Zabbix'te aktif olup ServiceCoreID içeren kayıt bulunamadı.")
+        log("İşlenecek kayıt bulunamadı (Ack edilenler hariç).")
     else:
         log(f"Kontrol edilecek eşleşme sayısı: {len(targets)}")
-        
-        # 2. Hızlıca Kontrol Et (Multi-Thread)
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            executor.map(check_and_reopen, targets)
+            executor.map(check_and_enforce_status, targets)
             
     log("--- Bitti ---")

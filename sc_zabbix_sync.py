@@ -22,7 +22,6 @@ ZBX_DOMAIN = "watchman.bulutistan.com"
 ZBX_REAL_IP = "10.6.116.178"
 
 # --- AYARLAR ---
-# Yasaklı Statüler (Kapalı, Çözüldü vb.)
 bad_ids_str = os.getenv("SC_BAD_STATUS_IDS", "2, 46, 83, 94, 65")
 SC_BAD_STATUS_IDS = [int(x.strip()) for x in bad_ids_str.split(',') if x.strip()]
 
@@ -43,8 +42,11 @@ def zbx_req(method, params):
     try:
         r = requests.post(ZBX_API_URL, json=payload, timeout=10, verify=False)
         return r.json().get('result')
-    except: return None
+    except Exception as e:
+        log(f"Zabbix Req Error: {e}")
+        return None
 
+# DETAYLI DEBUG REQ
 def sc_req(method, endpoint, data=None):
     headers = {'Content-Type': 'application/json', 'ApiKey': SC_API_TOKEN}
     url = f"{SC_API_URL}/api/v1/{endpoint}"
@@ -54,7 +56,9 @@ def sc_req(method, endpoint, data=None):
         else:
             r = requests.post(url, headers=headers, json=data, timeout=10, verify=False) if method == 'POST' else requests.put(url, headers=headers, json=data, timeout=10, verify=False)
         return r
-    except: return None
+    except Exception as e:
+        log(f"❌ HTTP BAĞLANTI HATASI ({endpoint}): {e}")
+        return None
 
 # ================= CORE LOGIC =================
 
@@ -97,21 +101,14 @@ def get_active_problems_with_ticket_ids():
     return targets
 
 def force_update_ticket(ticket_data, target_status):
-    """
-    Mevcut verileri koruyarak sadece Statü'yü günceller.
-    """
     ticket_id = ticket_data.get('Id')
-    
-    # Mevcut Agent'ı Koru (Yoksa 0 gider)
     current_agent = ticket_data.get('AgentId')
     
     payload = {
         "ticketId": ticket_id,
         "statusId": target_status,
-        "state": 1, # Her iki durumda da State 1 (Açık) uygundur
-        "agentId": current_agent, # MEVCUT AGENT KORUNUR
-        
-        # Diğer zorunlu alanlar
+        "state": 1, 
+        "agentId": current_agent,
         "ticketSubject": ticket_data.get('Subject') or ticket_data.get('TicketSubject'),
         "description": ticket_data.get('TicketDescription'),
         "orgUserId": ticket_data.get('OrgUserId'),
@@ -121,9 +118,12 @@ def force_update_ticket(ticket_data, target_status):
         "isActive": True
     }
     
+    log(f"   -> Payload Hazırlandı. Endpoint: Incident/Update (PUT)")
     res = sc_req('PUT', 'Incident/Update', payload)
     
-    if not res or res.status_code == 405: 
+    # 405 Method Not Allowed ise POST dene
+    if res and res.status_code == 405: 
+         log("   -> 405 Aldı, POST deneniyor...")
          res = sc_req('POST', 'Incident/Update', payload)
          
     return res
@@ -139,19 +139,15 @@ def check_and_rescue_ticket(target):
             data = res.json().get('Data', {})
             current_status = data.get('StatusId')
             
-            # Eğer statü yasaklı listedeyse (Kapalı, Çözüldü vb.)
             if current_status in SC_BAD_STATUS_IDS:
                 
                 # --- AKILLI STATÜ SEÇİMİ ---
                 current_agent = data.get('AgentId')
                 
-                # Eğer Ticket'ın bir sahibi varsa -> 78 (Atandı) yap.
                 if current_agent and current_agent > 0:
                     target_status = 78
                     log_msg = f"Ticket {t_id} (Agent: {current_agent}) -> Hedef: 78 (Atandı)"
                 else:
-                    # Eğer Ticket sahipsizse -> 1 (Üzerinde Çalışılıyor) yap.
-                    # Çünkü sahipsiz ticket "Atandı" olamaz.
                     target_status = 1
                     log_msg = f"Ticket {t_id} (Sahipsiz) -> Hedef: 1 (Üzerinde Çalışılıyor)"
                 
@@ -160,34 +156,38 @@ def check_and_rescue_ticket(target):
                 # Güncelleme Yap
                 reopen_res = force_update_ticket(data, target_status)
                 
-                success = False
-                if reopen_res:
+                # --- DETAYLI DEBUG LOGLAMA ---
+                if reopen_res is None:
+                    log("❌ HATA: API Cevap Vermedi (None döndü). Bağlantı hatası olabilir.")
+                else:
+                    log(f"   -> API HTTP Kodu: {reopen_res.status_code}")
                     try:
                         rj = reopen_res.json()
                         if rj.get('IsSuccessfull'):
-                            success = True
+                            log(f"✅ BAŞARILI: Ticket açıldı.")
+                            
+                            # Not ve Zabbix Ack işlemleri
+                            ticket_url = f"{SC_PANEL_URL}/Ticket/EditV2?id={t_id}"
+                            sc_req('POST', f'Incident/{t_id}/Conversations/Add', {
+                                "description": "Zabbix alarmı aktif olduğu için otomasyon tarafından tekrardan açıldı.",
+                                "isPrivate": True, "noteType": 1
+                            })
+                            zbx_msg = f"AWX Automation: Ticket {t_id} re-opened. | URL={ticket_url}"
+                            zbx_req("event.acknowledge", {
+                                "eventids": [e_id], "action": 4, 
+                                "message": zbx_msg
+                            })
+                            
                         else:
-                            log(f"❌ Hata: {rj.get('Message')}")
-                    except: pass
+                            log(f"❌ API HATA MESAJI: {rj.get('Message')}")
+                            if rj.get('ValidationErrors'):
+                                log(f"   Validation: {rj.get('ValidationErrors')}")
+                    except Exception as json_err:
+                        log(f"❌ JSON PARSE HATASI: {json_err}")
+                        log(f"   RAW RESPONSE: {reopen_res.text[:300]}") # İlk 300 karakteri bas
 
-                if success:
-                    log(f"✅ Başarılı. Yeni Statü: {target_status}")
-                    
-                    ticket_url = f"{SC_PANEL_URL}/Ticket/EditV2?id={t_id}"
-                    
-                    sc_req('POST', f'Incident/{t_id}/Conversations/Add', {
-                        "description": "Zabbix alarmı aktif olduğu için otomasyon tarafından tekrardan açıldı.",
-                        "isPrivate": True, "noteType": 1
-                    })
-                    
-                    zbx_msg = f"AWX Automation: Ticket {t_id} re-opened. | URL={ticket_url}"
-                    zbx_req("event.acknowledge", {
-                        "eventids": [e_id], "action": 4, 
-                        "message": zbx_msg
-                    })
-                    
         except Exception as e:
-            log(f"Hata: {e}")
+            log(f"❌ SCRİPT HATASI (Exception): {e}")
             pass
 
 if __name__ == "__main__":
@@ -195,7 +195,7 @@ if __name__ == "__main__":
         log("CRITICAL: API URL eksik.")
         exit(1)
 
-    log(f"--- ServiceCore Smart Sync (Auto: 78 or 1) ---")
+    log(f"--- ServiceCore Deep Debug Sync ---")
     
     targets = get_active_problems_with_ticket_ids()
     
@@ -203,7 +203,7 @@ if __name__ == "__main__":
         log("Müdahale edilecek kayıt bulunamadı.")
     else:
         log(f"Kontrol edilecek eşleşme sayısı: {len(targets)}")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             executor.map(check_and_rescue_ticket, targets)
             
     log("--- Bitti ---")

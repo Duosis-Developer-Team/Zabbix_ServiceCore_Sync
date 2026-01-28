@@ -1,5 +1,5 @@
 ---
-- name: ServiceCore & Zabbix Sync Automation (Assigned Mode)
+- name: ServiceCore & Zabbix Sync Automation (Safe Mode)
   hosts: localhost
   connection: local
   gather_facts: false
@@ -13,8 +13,18 @@
         SC_API_TOKEN: "{{ sc_token }}"
         ZBX_API_URL: "{{ zbx_url }}"
         ZBX_API_TOKEN: "{{ zbx_token }}"
-      
-        SC_REOPEN_STATUS_ID: "78"
+        
+        # --- YASAKLI STATÜLER ---
+        # 2:  Kapatılanlar
+        # 46: Tamamlanmış
+        # 83: Çözüldü
+        # 94: İptal Edildi
+        # 65: Ertelenen
+        SC_BAD_STATUS_IDS: "2, 46, 83, 94, 65"
+        
+        # --- HEDEF STATÜ ---
+        # Kurtarılan ticket hangi statüye gelsin? (78: Atandı)
+        SC_TARGET_STATUS_ID: "78"
         
       register: output
       ignore_errors: yes
@@ -22,5 +32,3 @@
     - name: Print Script Output
       debug:
         msg: "{{ output.stdout_lines }}"
-
-

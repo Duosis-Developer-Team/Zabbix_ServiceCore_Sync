@@ -13,10 +13,7 @@
         SC_API_TOKEN: "{{ sc_token }}"
         ZBX_API_URL: "{{ zbx_url }}"
         ZBX_API_TOKEN: "{{ zbx_token }}"
-        
-        # HEDEF STATÜ: 78 (Atandı)
-        # Ticket bu statü dışında herhangi bir şeyse (Örn: Kapalı, Beklemede, Açık)
-        # Zorla 78 yapılır.
+      
         SC_REOPEN_STATUS_ID: "78"
         
       register: output
@@ -25,4 +22,5 @@
     - name: Print Script Output
       debug:
         msg: "{{ output.stdout_lines }}"
+
 

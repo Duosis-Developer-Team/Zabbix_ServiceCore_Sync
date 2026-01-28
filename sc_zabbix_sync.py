@@ -26,10 +26,9 @@ ZBX_REAL_IP = "10.6.116.178"
 bad_ids_str = os.getenv("SC_BAD_STATUS_IDS", "2, 46, 83, 94, 65")
 SC_BAD_STATUS_IDS = [int(x.strip()) for x in bad_ids_str.split(',') if x.strip()]
 
-# HEDEF STATÜ: 78 (Atandı)
-SC_TARGET_STATUS_ID = 78
-# HEDEF STATE: 1 (JSON verine göre ID 78'in State'i 1'dir)
-SC_TARGET_STATE = 1 
+# HEDEF STATÜ: 1 (Üzerinde Çalışılıyor)
+# Agent gerektirmez, ticket'ı açar ve havuza atar. En güvenli yöntemdir.
+SC_TARGET_STATUS_ID = 1
 
 # ================= DNS OVERRIDE =================
 prv_getaddrinfo = socket.getaddrinfo
@@ -55,9 +54,9 @@ def sc_req(method, endpoint, data=None):
     url = f"{SC_API_URL}/api/v1/{endpoint}"
     try:
         if method == 'GET':
-            r = requests.get(url, headers=headers, params=data, timeout=5, verify=False)
+            r = requests.get(url, headers=headers, params=data, timeout=10, verify=False)
         else:
-            r = requests.post(url, headers=headers, json=data, timeout=5, verify=False) if method == 'POST' else requests.put(url, headers=headers, json=data, timeout=5, verify=False)
+            r = requests.post(url, headers=headers, json=data, timeout=10, verify=False) if method == 'POST' else requests.put(url, headers=headers, json=data, timeout=10, verify=False)
         return r
     except: return None
 
@@ -101,45 +100,11 @@ def get_active_problems_with_ticket_ids():
             
     return targets
 
-def force_update_ticket(ticket_data):
-    """
-    Ticket'ı UpdateTicketStatus ile değil, 
-    Incident/Update (Tam Düzenleme) ile zorlar.
-    """
-    ticket_id = ticket_data.get('Id')
-    
-    # Mevcut verileri koruyarak payload hazırla
-    payload = {
-        "ticketId": ticket_id,
-        # ÖNEMLİ: Statüyü ve State'i buradan zorluyoruz
-        "statusId": SC_TARGET_STATUS_ID,  # 78
-        "state": SC_TARGET_STATE,         # 1
-        
-        # Diğer zorunlu alanları mevcut veriden geri dolduruyoruz
-        # AgentId göndermiyoruz veya 0 gönderiyoruz
-        "agentId": ticket_data.get('AgentId') or 0,
-        "ticketSubject": ticket_data.get('Subject') or ticket_data.get('TicketSubject'),
-        "description": ticket_data.get('TicketDescription'),
-        "orgUserId": ticket_data.get('OrgUserId'),
-        "agentGroupId": ticket_data.get('AgentGroupId'),
-        "priorityId": ticket_data.get('PriorityId'),
-        "guid": ticket_data.get('Guid'),
-        "isActive": True # Aktif olduğunu teyit et
-    }
-    
-    # Önce PUT dene, olmazsa POST dene (SC versiyonuna göre değişebilir)
-    # Incident/Update genellikle PUT çalışır.
-    res = sc_req('PUT', 'Incident/Update', payload)
-    
-    if not res or res.status_code == 405: # Method Not Allowed
-         res = sc_req('POST', 'Incident/Update', payload)
-         
-    return res
-
 def check_and_rescue_ticket(target):
     t_id = target['ticket_id']
     e_id = target['event_id']
     
+    # 1. Ticket Detayını Çek
     res = sc_req('GET', f'Incident/GetById/{t_id}')
     
     if res and res.status_code == 200:
@@ -147,35 +112,47 @@ def check_and_rescue_ticket(target):
             data = res.json().get('Data', {})
             current_status = data.get('StatusId')
             
-            # Eğer statü yasaklı listedeyse (Kapalı, Çözüldü vb.)
+            # 2. Yasaklı listedeyse (Kapalı, Çözüldü vb.)
             if current_status in SC_BAD_STATUS_IDS:
                 
                 log(f"⚠️ MÜDAHALE: Ticket {t_id} (Statü: {current_status}) -> Hedef: {SC_TARGET_STATUS_ID}")
                 
-                # --- YENİ YÖNTEM: FORCE UPDATE ---
-                reopen_res = force_update_ticket(data)
+                # 3. BASİT GÜNCELLEME (UpdateTicketStatus)
+                # Bu endpoint daha az hata verir ve sadece statüyü değiştirir.
+                reopen_res = sc_req('PUT', 'Incident/UpdateTicketStatus', {
+                    "ticketId": t_id, 
+                    "statusId": SC_TARGET_STATUS_ID, 
+                    "closeReasonId": None
+                })
                 
                 if reopen_res and reopen_res.json().get('IsSuccessfull'):
-                    log(f"✅ Ticket {t_id} başarıyla {SC_TARGET_STATUS_ID} statüsüne zorlandı.")
+                    log(f"✅ Ticket {t_id} başarıyla tekrar açıldı (Statü: 1).")
                     
                     ticket_url = f"{SC_PANEL_URL}/Ticket/EditV2?id={t_id}"
                     
+                    # SC Notu
                     sc_req('POST', f'Incident/{t_id}/Conversations/Add', {
                         "description": "Zabbix alarmı aktif olduğu için otomasyon tarafından tekrardan açıldı.",
                         "isPrivate": True, "noteType": 1
                     })
                     
+                    # Zabbix Mesajı
                     zbx_msg = f"AWX Automation: Ticket {t_id} re-opened. | URL={ticket_url}"
                     zbx_req("event.acknowledge", {
                         "eventids": [e_id], "action": 4, 
                         "message": zbx_msg
                     })
                 else:
-                    err_msg = reopen_res.json().get('Message') if reopen_res else "Bilinmeyen Hata"
-                    log(f"❌ Güncelleme Başarısız: {err_msg}")
+                    # Hata Ayıklama (Gelişmiş)
+                    error_detail = "Bilinmiyor"
+                    if reopen_res:
+                        try:
+                            error_detail = reopen_res.text # API'nin döndüğü tam hatayı görelim
+                        except: pass
+                    log(f"❌ Güncelleme Başarısız. API Cevabı: {error_detail}")
                     
         except Exception as e:
-            log(f"Hata oluştu: {e}")
+            log(f"Kod Hatası: {e}")
             pass
 
 if __name__ == "__main__":
@@ -183,12 +160,12 @@ if __name__ == "__main__":
         log("CRITICAL: API URL eksik.")
         exit(1)
 
-    log(f"--- ServiceCore Safe Sync (Target Status: {SC_TARGET_STATUS_ID} | State: {SC_TARGET_STATE}) ---")
+    log(f"--- ServiceCore Sync (Target Status: {SC_TARGET_STATUS_ID}) ---")
     
     targets = get_active_problems_with_ticket_ids()
     
     if not targets:
-        log("Müdahale edilecek kayıt bulunamadı (Temiz).")
+        log("Müdahale edilecek kayıt bulunamadı.")
     else:
         log(f"Kontrol edilecek eşleşme sayısı: {len(targets)}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:

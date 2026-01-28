@@ -24,7 +24,7 @@ ZBX_REAL_IP = "10.6.116.178"
 # ServiceCore Ayarları
 closed_ids_str = os.getenv("SC_CLOSED_STATUS_IDS", "2")
 SC_STATUS_CLOSED_IDS = [int(x.strip()) for x in closed_ids_str.split(',') if x.strip()]
-SC_STATUS_REOPEN_ID = int(os.getenv("SC_REOPEN_STATUS_ID", "1"))
+SC_STATUS_REOPEN_ID = int(os.getenv("SC_REOPEN_STATUS_ID", "83"))
 
 # ================= DNS OVERRIDE =================
 prv_getaddrinfo = socket.getaddrinfo
@@ -156,3 +156,4 @@ if __name__ == "__main__":
             executor.map(check_and_reopen, targets)
             
     log("--- Bitti ---")
+

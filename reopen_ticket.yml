@@ -1,27 +1,27 @@
 ---
-- name: ServiceCore & Zabbix Sync Automation
+- name: ServiceCore & Zabbix Sync Automation (Assigned Mode)
   hosts: localhost
   connection: local
   gather_facts: false
-  
+
   tasks:
     - name: Run Python Sync Script
       ansible.builtin.command: >
-        python3 sc_zabbix_sync.py
+        python3 sc_sync_v4_assigned.py
       environment:
         SC_API_URL: "{{ sc_url }}"
         SC_API_TOKEN: "{{ sc_token }}"
         ZBX_API_URL: "{{ zbx_url }}"
         ZBX_API_TOKEN: "{{ zbx_token }}"
         
-        # Diğer değişkenler
-        SC_CLOSED_STATUS_IDS: "{{ sc_closed_ids | default('2') }}"
-        SC_REOPEN_STATUS_ID: "{{ sc_reopen_id | default('1') }}"
-        SC_FIELD_KEY: "Eventid"
+        # HEDEF STATÜ: 78 (Atandı)
+        # Ticket bu statü dışında herhangi bir şeyse (Örn: Kapalı, Beklemede, Açık)
+        # Zorla 78 yapılır.
+        SC_REOPEN_STATUS_ID: "78"
+        
       register: output
+      ignore_errors: yes
 
     - name: Print Script Output
       debug:
         msg: "{{ output.stdout_lines }}"
-
-

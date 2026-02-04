@@ -22,7 +22,6 @@ ZBX_REAL_IP = "10.6.116.178"
 
 # --- MÜDAHALE EDİLECEK STATÜLER ---
 # 2: Kapalı, 83: Çözüldü, 94: İptal, 46: Tamamlanmış, 65: Ertelenen
-# Bu statülerden herhangi birindeyse ve alarm aktifse müdahale edilir.
 bad_ids_str = os.getenv("SC_BAD_STATUS_IDS", "2, 83, 94, 46, 65")
 SC_BAD_STATUS_IDS = [int(x.strip()) for x in bad_ids_str.split(',') if x.strip()]
 
@@ -72,7 +71,6 @@ def get_active_problems_with_ticket_ids():
     
     targets = []
     for p in problems:
-        # Eğer ACK (Onay) varsa dokunma
         if str(p.get('acknowledged')) == "1": continue
         
         for ack in p.get('acknowledges', []):
@@ -111,52 +109,51 @@ def check_and_enforce_workflow(target):
             if current_status in SC_BAD_STATUS_IDS:
                 
                 # --- HEDEF BELİRLEME ---
-                # Eğer Agent varsa 78 (Atandı), yoksa 1 (Açık) olmak zorunda.
                 final_target = 78 if (agent_id and agent_id > 0) else 1
                 
-                log(f" MÜDAHALE: Ticket {t_id} (Statü: {current_status}) -> Hedef: {final_target}")
+                log(f"⚠️ MÜDAHALE: Ticket {t_id} (Statü: {current_status}) -> Hedef: {final_target}")
                 
                 operation_success = False
                 
                 # --- SENARYO 1: TICKET KAPALIYSA (Status: 2) ---
                 if current_status == 2:
                     log(f"   -> [Senaryo: Kapalı] Önce 1'e çekiliyor (Uyandırma)...")
-                    ok1, msg1 = update_status(t_id, 1) # Önce Açık Yap
+                    ok1, msg1 = update_status(t_id, 1) 
                     
                     if ok1:
                         if final_target == 78:
                             log(f"   -> [Senaryo: Kapalı] Şimdi 78'e çekiliyor (Atama)...")
-                            ok2, msg2 = update_status(t_id, 78) # Sonra Atandı Yap
+                            ok2, msg2 = update_status(t_id, 78) 
                             if ok2: operation_success = True
-                            else: log(f"   ->  78 yapılamadı, 1 olarak kaldı. Hata: {msg2}")
+                            else: log(f"   -> ❌ 78 yapılamadı, 1 olarak kaldı. Hata: {msg2}")
                         else:
-                            operation_success = True # Hedef zaten 1 ise işlem tamam
+                            operation_success = True 
                     else:
-                        log(f"   ->  Uyandırma başarısız. Hata: {msg1}")
+                        log(f"   -> ❌ Uyandırma başarısız. Hata: {msg1}")
 
-                # --- SENARYO 2: TICKET ÇÖZÜLDÜYSE (Status: 83, 94, 46 vb.) ---
+                # --- SENARYO 2: TICKET ÇÖZÜLDÜYSE (Status: 83 vb.) ---
                 else:
-                    # Kapalı değil ama 'Çözüldü' veya 'İptal' ise direkt hedefe çekebiliriz.
                     log(f"   -> [Senaryo: Aktif/Çözüldü] Direkt {final_target} yapılıyor...")
                     ok, msg = update_status(t_id, final_target)
                     if ok: operation_success = True
-                    else: log(f"   ->  Güncelleme başarısız. Hata: {msg}")
+                    else: log(f"   -> ❌ Güncelleme başarısız. Hata: {msg}")
 
                 # --- SONUÇ BİLDİRİMİ ---
                 if operation_success:
-                    log(f" Ticket {t_id} kurtarıldı.")
+                    log(f"✅ Ticket {t_id} kurtarıldı.")
                     
-                    # Not Ekle
                     sc_post(f'Incident/{t_id}/Conversations/Add', {
                         "description": "Zabbix alarmı devam ettiği için otomasyon tarafından statü güncellendi.",
                         "isPrivate": True, "noteType": 1
                     })
                     
-                    # Zabbix Mesaj (URL'li)
                     ticket_url = f"{SC_PANEL_URL}/Ticket/EditV2?id={t_id}"
                     zbx_msg = f"AWX Automation: Ticket {t_id} updated. | URL={ticket_url}"
-                    # Ack: 4 (Sadece Mesaj, Onaylama Yok)
                     zbx_req("event.acknowledge", {"eventids": [e_id], "action": 4, "message": zbx_msg})
+            
+            # --- [YENİ] EĞER MÜDAHALE GEREKMİYORSA ---
+            else:
+                log(f"ℹ️ PAS GEÇİLDİ: Ticket {t_id} statüsü uygun ({current_status}). Müdahale gerekmez.")
                     
         except Exception as e:
             log(f"Hata: {e}")

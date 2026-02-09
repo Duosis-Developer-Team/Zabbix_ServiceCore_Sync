@@ -63,7 +63,7 @@ def get_active_problems_with_ticket_ids():
         "output": ["eventid", "name", "acknowledged"],
         "selectAcknowledges": "extend",
         "recent": False,
-        "sortfield": ["eventid"], "sortorder": "DESC", "limit": 1000
+        "sortfield": ["eventid"], "sortorder": "DESC", "limit": 5000
     }
     
     problems = zbx_req("problem.get", params)
@@ -174,3 +174,4 @@ if __name__ == "__main__":
     else:
         log("İşlenecek kayıt yok.")
     log("Bitti.")
+

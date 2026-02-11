@@ -49,13 +49,39 @@ def sc_get(endpoint):
     try: return requests.get(f"{SC_API_URL}/api/v1/{endpoint}", headers={'Content-Type': 'application/json', 'ApiKey': SC_API_TOKEN}, timeout=10, verify=False)
     except: return None
 
-def sc_put(endpoint, data):
-    try: return requests.put(f"{SC_API_URL}/api/v1/{endpoint}", headers={'Content-Type': 'application/json', 'ApiKey': SC_API_TOKEN}, json=data, timeout=10, verify=False)
-    except: return None
-
 def sc_post(endpoint, data):
     try: return requests.post(f"{SC_API_URL}/api/v1/{endpoint}", headers={'Content-Type': 'application/json', 'ApiKey': SC_API_TOKEN}, json=data, timeout=10, verify=False)
     except: return None
+
+# --- GÜNCELLENMİŞ UPDATE FONKSİYONU (DEBUG İÇİN) ---
+def update_status(ticket_id, status_id):
+    """ServiceCore Statü Güncelleme - DEBUG MODU"""
+    url = f"{SC_API_URL}/api/v1/Incident/UpdateTicketStatus"
+    payload = {
+        "ticketId": int(ticket_id), 
+        "statusId": int(status_id), 
+        "closeReasonId": None
+    }
+    
+    try:
+        res = requests.put(url, headers={'Content-Type': 'application/json', 'ApiKey': SC_API_TOKEN}, json=payload, timeout=15, verify=False)
+        
+        if res.status_code == 200:
+            rj = res.json()
+            is_success = rj.get('IsSuccessfull')
+            message = rj.get('Message')
+            
+            # HATA VARSA DETAYI BAS
+            if not is_success:
+                log(f"⚠️ DEBUG FAIL RESPONSE ({ticket_id}): {res.text}")
+                
+            return is_success, message
+        else:
+            log(f"❌ HTTP ERROR {res.status_code} ({ticket_id}): {res.text}")
+            return False, f"HTTP {res.status_code}"
+            
+    except Exception as e:
+        return False, str(e)
 
 # ================= CORE LOGIC =================
 
@@ -79,12 +105,10 @@ def get_active_problems_with_ticket_ids():
     targets = []
     for p in problems:
         # --- KURAL 1: EĞER PROBLEM ACKNOWLEDGE EDİLMİŞSE PAS GEÇ ---
-        # Bu satır eklendiği için, operatör "Gördüm" dediyse (Ack=1),
-        # ticket kapalı olsa bile tekrar açmaz.
         if str(p.get('acknowledged')) == "1":
             continue
 
-        # --- KURAL 2: ID BULMAK İÇİN NOTLARA BAKMAYA DEVAM ET ---
+        # --- KURAL 2: ID BULMAK İÇİN NOTLARA BAK ---
         acks = p.get('acknowledges', [])
         if not acks:
             continue 
@@ -102,17 +126,6 @@ def get_active_problems_with_ticket_ids():
     
     return targets
 
-def update_status(ticket_id, status_id):
-    res = sc_put('Incident/UpdateTicketStatus', {
-        "ticketId": int(ticket_id), 
-        "statusId": int(status_id), 
-        "closeReasonId": None
-    })
-    if res and res.status_code == 200:
-        rj = res.json()
-        return rj.get('IsSuccessfull'), rj.get('Message')
-    return False, "HTTP Error"
-
 def check_and_enforce_workflow(target):
     t_id = target['ticket_id']
     e_id = target['event_id']
@@ -129,7 +142,7 @@ def check_and_enforce_workflow(target):
             # 2. Eğer Ticket 'Kötü Statü' listesindeyse
             if current_status in SC_BAD_STATUS_IDS:
                 
-                # Hedef Statü: Agent varsa 78, yoksa 1
+                # Hedef Statü: Agent varsa 78 (Atandı), yoksa 1 (Yeni)
                 final_target = 78 if (agent_id and agent_id > 0) else 1
                 
                 log(f"⚠️ MÜDAHALE: Ticket {t_id} (Statü: {current_status}) -> Hedef: {final_target}")
@@ -139,12 +152,15 @@ def check_and_enforce_workflow(target):
                 # --- SENARYO 1: TICKET KAPALIYSA (Status: 2) ---
                 if current_status == 2:
                     log(f"   -> [Senaryo: Kapalı] Önce 1'e çekiliyor...")
+                    # 1 Saniye bekle (Rate Limit Önlemi)
+                    time.sleep(1)
+                    
                     ok1, msg1 = update_status(t_id, 1) 
                     
                     if ok1:
                         if final_target == 78:
-                            time.sleep(1) 
                             log(f"   -> [Senaryo: Kapalı] Şimdi 78'e çekiliyor...")
+                            time.sleep(1) # Ardışık işlem arası bekleme
                             ok2, msg2 = update_status(t_id, 78) 
                             if ok2: operation_success = True
                             else: log(f"   -> ❌ 78 yapılamadı, 1 kaldı. Hata: {msg2}")
@@ -156,6 +172,7 @@ def check_and_enforce_workflow(target):
                 # --- SENARYO 2: TICKET ÇÖZÜLDÜYSE (Status: 83 vb.) ---
                 else:
                     log(f"   -> [Senaryo: Çözüldü] Direkt {final_target} yapılıyor...")
+                    time.sleep(0.5)
                     ok, msg = update_status(t_id, final_target)
                     if ok: operation_success = True
                     else: log(f"   -> ❌ Güncelleme başarısız. Hata: {msg}")
@@ -170,10 +187,11 @@ def check_and_enforce_workflow(target):
                     })
                     
                     ticket_url = f"{SC_PANEL_URL}/Ticket/EditV2?id={t_id}"
-                    zbx_msg = f"AWX Automation: Ticket {t_id} Re-opened (Unacknowledged Problem). | URL={ticket_url}"
+                    zbx_msg = f"AWX Automation: Ticket {t_id} Re-opened (Unack). | URL={ticket_url}"
                     zbx_req("event.acknowledge", {"eventids": [e_id], "action": 4, "message": zbx_msg})
             
             else:
+                # log(f"ℹ️ PAS: Ticket {t_id} açık durumda ({current_status}).")
                 pass
                     
         except Exception as e:
@@ -184,13 +202,16 @@ if __name__ == "__main__":
         log("HATA: API URL Eksik!")
         exit(1)
         
-    log(f"--- ServiceCore Logic (Ack=Skip, Unack=Reopen) ---")
+    log(f"--- ServiceCore DEBUG Mode (Workers=1) ---")
     
     targets = get_active_problems_with_ticket_ids()
     
     if targets:
         log(f"İşlenecek Kayıt: {len(targets)}")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        
+        # --- DEĞİŞİKLİK: Workers=1 yaparak tek tek işletiyoruz ---
+        # Bu sayede hem API'yi boğmuyoruz hem de hataları sırayla görüyoruz.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             executor.map(check_and_enforce_workflow, targets)
     else:
         log("İşlenecek (Ack olmayan) kayıt yok.")

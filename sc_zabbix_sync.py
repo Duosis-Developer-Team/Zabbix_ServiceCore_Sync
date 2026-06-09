@@ -73,35 +73,46 @@ def sc_post(endpoint, data):
 # ================= CORE LOGIC =================
 
 def get_active_problems_with_ticket_ids():
-    # --- YENİ FİLTRE: SON 30 GÜN HESABI ---
+    # --- SON 30 GÜN HESABI ---
     time_from = int(time.time()) - (30 * 24 * 60 * 60)
     
-    log("Zabbix 7.0 uyumlu problemler taranıyor (Ack Olmayanlar & Son 30 Gün filtreli)...")
+    log("Zabbix 7.0 Açık Problemleri taranıyor...")
     
-    # Zabbix 7.0 standardı için 'select_acknowledges' kullanıldı.
-    # problem.get içinde time_from desteklenmediği için clock bilgisini çekip aşağıda filtreliyoruz.
-    params = {
-        "output": ["eventid", "name", "acknowledged", "clock"],
-        "select_acknowledges": ["message", "action"], 
+    # Adım 1: problem.get ile sadece açık olan ve ack edilmemiş eventid'leri topluyoruz
+    prob_params = {
+        "output": ["eventid", "clock"],
+        "acknowledged": False, # Sadece acknowledge edilmeyenleri en baştan filtrele
         "sortfield": ["eventid"], 
         "sortorder": "DESC"
     }
     
-    problems = zbx_req("problem.get", params)
-    if not problems: return []
+    problems = zbx_req("problem.get", prob_params)
+    if not problems: 
+        log("Açık ve Onaylanmamış problem bulunamadı.")
+        return []
+        
+    # Son 30 gün içinde olan event ID'lerini filtrele
+    event_ids = [p['eventid'] for p in problems if int(p.get('clock', 0)) >= time_from]
+    if not event_ids:
+        log("Son 30 güne ait aktif problem ID'si yok.")
+        return []
+
+    log(f"Bulunan {len(event_ids)} adet problem için event detayları ve notlar çekiliyor...")
+
+    # Adım 2: Toplanan eventid'ler ile event.get metodunu çağırıp notları (acknowledges) çekiyoruz
+    # Zabbix 7.0'da event.get üzerinde 'select_acknowledges' resmi olarak desteklenir.
+    event_params = {
+        "output": ["eventid"],
+        "eventids": event_ids,
+        "select_acknowledges": ["message"]
+    }
+    
+    events = zbx_req("event.get", event_params)
+    if not events: return []
     
     targets = []
-    for p in problems:
-        # --- KURAL 1: SON 30 GÜN KONTROLÜ (Zabbix 7.0 Manuel Filtreleme) ---
-        if int(p.get('clock', 0)) < time_from:
-            continue
-
-        # --- KURAL 2: EĞER PROBLEM ACKNOWLEDGE EDİLMİŞSE PAS GEÇ ---
-        if str(p.get('acknowledged')) == "1":
-            continue
-
-        # --- KURAL 3: GÜNCELLEME NOTLARINI (ACKNOWLEDGES) TARA VE ID BUL ---
-        acknowledges = p.get('acknowledges', [])
+    for e in events:
+        acknowledges = e.get('acknowledges', [])
         if not acknowledges:
             continue 
             
@@ -111,7 +122,7 @@ def get_active_problems_with_ticket_ids():
             
             if match:
                 targets.append({
-                    "event_id": p.get('eventid'), 
+                    "event_id": e.get('eventid'), 
                     "ticket_id": match.group(1)
                 })
                 break 
@@ -188,7 +199,7 @@ def check_and_enforce_workflow(target):
                     ticket_url = f"{SC_PANEL_URL}/Ticket/EditV2?id={t_id}"
                     zbx_msg = f"AWX Automation: Ticket {t_id} updated. | URL={ticket_url}"
                     
-                    # Zabbix 7.0 için event.acknowledge yerine event.update metodu çağrıldı
+                    # Zabbix 7.0 uyumlu event.update çağrısı
                     zbx_req("event.update", {
                         "eventids": [e_id], 
                         "action": 4, 
@@ -196,7 +207,6 @@ def check_and_enforce_workflow(target):
                     })
             
             else:
-                # log(f"ℹ️ PAS GEÇİLDİ: Ticket {t_id} statüsü uygun ({current_status}). Müdahale gerekmez.")
                 pass
                     
         except Exception as e:

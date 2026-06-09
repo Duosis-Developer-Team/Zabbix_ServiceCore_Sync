@@ -81,7 +81,7 @@ def get_active_problems_with_ticket_ids():
     # Adım 1: problem.get ile sadece açık olan ve ack edilmemiş eventid'leri topluyoruz
     prob_params = {
         "output": ["eventid", "clock"],
-        "acknowledged": False, # Sadece acknowledge edilmeyenleri en baştan filtrele
+        "acknowledged": False, 
         "sortfield": ["eventid"], 
         "sortorder": "DESC"
     }
@@ -100,7 +100,6 @@ def get_active_problems_with_ticket_ids():
     log(f"Bulunan {len(event_ids)} adet problem için event detayları ve notlar çekiliyor...")
 
     # Adım 2: Toplanan eventid'ler ile event.get metodunu çağırıp notları (acknowledges) çekiyoruz
-    # Zabbix 7.0'da event.get üzerinde 'select_acknowledges' resmi olarak desteklenir.
     event_params = {
         "output": ["eventid"],
         "eventids": event_ids,
@@ -199,10 +198,10 @@ def check_and_enforce_workflow(target):
                     ticket_url = f"{SC_PANEL_URL}/Ticket/EditV2?id={t_id}"
                     zbx_msg = f"AWX Automation: Ticket {t_id} updated. | URL={ticket_url}"
                     
-                    # Zabbix 7.0 uyumlu event.update çağrısı
-                    zbx_req("event.update", {
+                    # Zabbix harici API'de event'e mesaj eklemek için 'event.acknowledge' metoduna geri dönüldü
+                    zbx_req("event.acknowledge", {
                         "eventids": [e_id], 
-                        "action": 4, 
+                        "action": 4, # 4: Add message standardı Zabbix 7.0'da da korunmaktadır
                         "message": zbx_msg
                     })
             

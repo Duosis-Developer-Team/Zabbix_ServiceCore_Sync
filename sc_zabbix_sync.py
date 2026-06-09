@@ -38,9 +38,20 @@ def log(msg): print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 def zbx_req(method, params):
     try:
-        r = requests.post(ZBX_API_URL, json={"jsonrpc": "2.0", "method": method, "params": params, "auth": ZBX_API_TOKEN, "id": 1}, timeout=15, verify=False)
-        return r.json().get('result')
-    except: return None
+        r = requests.post(
+            ZBX_API_URL, 
+            json={"jsonrpc": "2.0", "method": method, "params": params, "auth": ZBX_API_TOKEN, "id": 1}, 
+            timeout=15, 
+            verify=False
+        )
+        response_json = r.json()
+        # API'den dönen yapısal bir hata varsa loglarda görebilmek için:
+        if "error" in response_json:
+            log(f"❌ Zabbix API Hatası ({method}): {response_json['error'].get('data', response_json['error'].get('message'))}")
+        return response_json.get('result')
+    except Exception as e: 
+        log(f"❌ Zabbix API Bağlantı Hatası ({method}): {e}")
+        return None
 
 # ServiceCore İstek Yardımcıları
 def sc_get(endpoint):
@@ -58,15 +69,16 @@ def sc_post(endpoint, data):
 # ================= CORE LOGIC =================
 
 def get_active_problems_with_ticket_ids():
-    # --- YENİ FİLTRE: SON 30 GÜN ---
+    # --- YENİ FİLTRE: SON 30 GÜN HESABI ---
     time_from = int(time.time()) - (30 * 24 * 60 * 60)
     
-    log("Zabbix problemleri taranıyor (Son 30 gün, Notlu & Ack Olmayanlar)...")
+    log("Zabbix 7.0 uyumlu problemler taranıyor (Ack Olmayanlar & Son 30 Gün filtreli)...")
     
+    # Zabbix 7.0 için selectAcknowledges kaldırıldı, selectUpdates getirildi.
+    # problem.get içinden time_from kalktığı için clock bilgisini alıp aşağıda filtreliyoruz.
     params = {
-        "output": ["eventid", "name", "acknowledged"],
-        "selectAcknowledges": "extend",
-        "time_from": time_from,         # Limit yerine tarih kısıtı
+        "output": ["eventid", "name", "acknowledged", "clock"],
+        "selectUpdates": ["message", "action"], 
         "sortfield": ["eventid"], 
         "sortorder": "DESC"
     }
@@ -76,17 +88,21 @@ def get_active_problems_with_ticket_ids():
     
     targets = []
     for p in problems:
-        # --- KURAL 1: EĞER PROBLEM ACKNOWLEDGE EDİLMİŞSE PAS GEÇ (HATA YOK) ---
+        # --- KURAL 1: SON 30 GÜN KONTROLÜ (Zabbix 7.0 Manuel Filtreleme) ---
+        if int(p.get('clock', 0)) < time_from:
+            continue
+
+        # --- KURAL 2: EĞER PROBLEM ACKNOWLEDGE EDİLMİŞSE PAS GEÇ ---
         if str(p.get('acknowledged')) == "1":
             continue
 
-        # --- KURAL 2: NOTLARI TARA VE ID BUL ---
-        acks = p.get('acknowledges', [])
-        if not acks:
+        # --- KURAL 3: GÜNCELLEME NOTLARINI (UPDATES) TARA VE ID BUL ---
+        updates = p.get('updates', [])
+        if not updates:
             continue 
             
-        for ack in acks:
-            msg = ack.get('message', '')
+        for upd in updates:
+            msg = upd.get('message', '')
             match = re.search(r'ServiceCoreID\s*=\s*(\d+)', msg, re.IGNORECASE)
             
             if match:
@@ -167,7 +183,13 @@ def check_and_enforce_workflow(target):
                     
                     ticket_url = f"{SC_PANEL_URL}/Ticket/EditV2?id={t_id}"
                     zbx_msg = f"AWX Automation: Ticket {t_id} updated. | URL={ticket_url}"
-                    zbx_req("event.acknowledge", {"eventids": [e_id], "action": 4, "message": zbx_msg})
+                    
+                    # Zabbix 7.0 ile kalkan event.acknowledge yerine event.update kullanıldı
+                    zbx_req("event.update", {
+                        "eventids": [e_id], 
+                        "action": 4, 
+                        "message": zbx_msg
+                    })
             
             else:
                 # log(f"ℹ️ PAS GEÇİLDİ: Ticket {t_id} statüsü uygun ({current_status}). Müdahale gerekmez.")
@@ -181,12 +203,12 @@ if __name__ == "__main__":
         log("API URL Eksik")
         exit(1)
         
-    log(f"--- ServiceCore Advanced Logic Sync (Son 30 Gün / Ack Hariç) ---")
+    log(f"--- ServiceCore Advanced Logic Sync (Zabbix 7.0 LTS Ready) ---")
     
     targets = get_active_problems_with_ticket_ids()
     if targets:
         log(f"İşlenecek: {len(targets)}")
-        # Hız dengesi için 4 thread (10 hata veriyor, 1 yavaş kalıyor)
+        # Hız dengesi için 4 thread
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             executor.map(check_and_enforce_workflow, targets)
     else:

@@ -14,7 +14,12 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ================= CONFIG =================
 SC_API_URL = os.getenv("SC_API_URL", "").rstrip('/')
 SC_API_TOKEN = os.getenv("SC_API_TOKEN")
-ZBX_API_URL = os.getenv("ZBX_API_URL") 
+
+# URL Protokol Kontrolü (Başına http/https eklenmediyse otomatik düzeltir)
+ZBX_API_URL = os.getenv("ZBX_API_URL", "")
+if ZBX_API_URL and not ZBX_API_URL.startswith(("http://", "https://")):
+    ZBX_API_URL = f"http://{ZBX_API_URL}"
+
 ZBX_API_TOKEN = os.getenv("ZBX_API_TOKEN")
 SC_PANEL_URL = "https://operationsupport.bulutistan.com"
 
@@ -45,7 +50,6 @@ def zbx_req(method, params):
             verify=False
         )
         response_json = r.json()
-        # API'den dönen yapısal bir hata varsa loglarda görebilmek için:
         if "error" in response_json:
             log(f"❌ Zabbix API Hatası ({method}): {response_json['error'].get('data', response_json['error'].get('message'))}")
         return response_json.get('result')
@@ -74,11 +78,11 @@ def get_active_problems_with_ticket_ids():
     
     log("Zabbix 7.0 uyumlu problemler taranıyor (Ack Olmayanlar & Son 30 Gün filtreli)...")
     
-    # Zabbix 7.0 için selectAcknowledges kaldırıldı, selectUpdates getirildi.
-    # problem.get içinden time_from kalktığı için clock bilgisini alıp aşağıda filtreliyoruz.
+    # Zabbix 7.0 standardı için 'select_acknowledges' kullanıldı.
+    # problem.get içinde time_from desteklenmediği için clock bilgisini çekip aşağıda filtreliyoruz.
     params = {
         "output": ["eventid", "name", "acknowledged", "clock"],
-        "selectUpdates": ["message", "action"], 
+        "select_acknowledges": ["message", "action"], 
         "sortfield": ["eventid"], 
         "sortorder": "DESC"
     }
@@ -96,13 +100,13 @@ def get_active_problems_with_ticket_ids():
         if str(p.get('acknowledged')) == "1":
             continue
 
-        # --- KURAL 3: GÜNCELLEME NOTLARINI (UPDATES) TARA VE ID BUL ---
-        updates = p.get('updates', [])
-        if not updates:
+        # --- KURAL 3: GÜNCELLEME NOTLARINI (ACKNOWLEDGES) TARA VE ID BUL ---
+        acknowledges = p.get('acknowledges', [])
+        if not acknowledges:
             continue 
             
-        for upd in updates:
-            msg = upd.get('message', '')
+        for ack in acknowledges:
+            msg = ack.get('message', '')
             match = re.search(r'ServiceCoreID\s*=\s*(\d+)', msg, re.IGNORECASE)
             
             if match:
@@ -184,7 +188,7 @@ def check_and_enforce_workflow(target):
                     ticket_url = f"{SC_PANEL_URL}/Ticket/EditV2?id={t_id}"
                     zbx_msg = f"AWX Automation: Ticket {t_id} updated. | URL={ticket_url}"
                     
-                    # Zabbix 7.0 ile kalkan event.acknowledge yerine event.update kullanıldı
+                    # Zabbix 7.0 için event.acknowledge yerine event.update metodu çağrıldı
                     zbx_req("event.update", {
                         "eventids": [e_id], 
                         "action": 4, 
@@ -208,7 +212,6 @@ if __name__ == "__main__":
     targets = get_active_problems_with_ticket_ids()
     if targets:
         log(f"İşlenecek: {len(targets)}")
-        # Hız dengesi için 4 thread
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             executor.map(check_and_enforce_workflow, targets)
     else:
